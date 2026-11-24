@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>selective-undo</title>
+<meta name="description" content="Collaborative undo in Tilo's resource store: a design and benchmark, upstream's own implementation, a 26-second lookup fixed in one function (issue 5993), and two state bugs in the revert with a fix. Proposed work, not merged upstream.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Mono:wght@400;700&family=Atkinson+Hyperlegible+Next:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #12110f; --panel: #1a1916; --panel2: #221f1b; --ink: #efe8d6; --muted: #a8a190; --rule: #efe8d6; --soft: #3a362d;
+  --blue: #1f45a6; --link: #9db3ff; --red: #d0291c; --redt: #f2685a; --yellow: #f2b51c; --on-blue: #f8f2e4; --on-yellow: #141412;
+  --yt: #f2b51c; --bad-bg: #2b1815; --good-bg: #16203d; --note: #2a2310; --code: #221f1b; --ghost: #1f45a6;
+  --sans: "Atkinson Hyperlegible Next", "Atkinson Hyperlegible", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "Atkinson Hyperlegible Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --pad: clamp(1rem, 2.2vw, 2rem);
+}
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) { color-scheme: light; --bg: #f0e9d8; --panel: #fbf7ec; --panel2: #f6f0e0; --ink: #141412; --muted: #5d584e; --rule: #141412; --soft: #cfc5aa; --link: #1f45a6; --redt: #c0261a; --yt: #8a5a00; --bad-bg: #fde3df; --good-bg: #dfe4fb; --note: #fdf0c4; --code: #e8e0cb; --ghost: #1f45a64d; } }
+:root[data-theme="light"] { color-scheme: light; --bg: #f0e9d8; --panel: #fbf7ec; --panel2: #f6f0e0; --ink: #141412; --muted: #5d584e; --rule: #141412; --soft: #cfc5aa; --link: #1f45a6; --redt: #c0261a; --yt: #8a5a00; --bad-bg: #fde3df; --good-bg: #dfe4fb; --note: #fdf0c4; --code: #e8e0cb; --ghost: #1f45a64d; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { animation: none !important; transition: none !important; } }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 1.0625rem; line-height: 1.62; position: relative; }
+body::before { content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .07; z-index: 0; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .5 0 0 0 0 .5 0 0 0 0 .5 0 0 0 1.6 -.82'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)'/%3E%3C/svg%3E"); }
+header, main, footer { position: relative; z-index: 1; }
+.wrap { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+.col { max-width: 760px; margin-inline: auto; }
+.wide { max-width: 1040px; margin-inline: auto; }
+a { color: var(--link); text-underline-offset: 3px; }
+:focus-visible { outline: 3px solid var(--yellow); outline-offset: 2px; }
+h1, h2, h3 { text-wrap: balance; line-height: 1.15; margin: 0; }
+h1 { font-size: clamp(2.1rem, 5.4vw, 3.4rem); letter-spacing: -.02em; font-weight: 700; }
+h2 { font-size: clamp(1.5rem, 3.4vw, 2rem); font-weight: 700; letter-spacing: -.015em; }
+h3 { font-size: 1.12rem; font-weight: 700; }
+p, ul, ol { margin: 0; } ul, ol { padding-left: 1.25rem; display: flex; flex-direction: column; gap: .4rem; }
+code { font-family: var(--mono); font-size: .86em; background: var(--code); padding: .08em .35em; overflow-wrap: anywhere; }
+pre { font-family: var(--mono); font-size: .8rem; background: var(--panel); border: 2px solid var(--rule); padding: .9rem 1rem; overflow-x: auto; margin: 0; line-height: 1.5; position: relative; }
+pre code { background: none; padding: 0; overflow-wrap: normal; }
+.copy { position: absolute; top: .4rem; right: .4rem; font: inherit; font-family: var(--mono); font-size: .72rem; background: var(--bg); color: var(--ink); border: 2px solid var(--rule); padding: .1rem .5rem; cursor: pointer; }
+.muted { color: var(--muted); } .small { font-size: .84rem; }
+.eyebrow { font-family: var(--mono); font-size: .8rem; color: var(--redt); font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.stack { display: flex; flex-direction: column; gap: 1.1rem; }
+section { padding-block: 2.8rem; }
+section + section { border-top: 2px solid var(--rule); }
+.bar { position: sticky; top: 0; z-index: 10; background: var(--bg); border-bottom: 2px solid var(--rule); }
+.bar-in { display: flex; align-items: center; gap: 1rem; padding-block: .55rem; }
+.brand { font-family: var(--mono); font-weight: 700; white-space: nowrap; display: flex; align-items: center; gap: .55rem; }
+.brand b { display: inline-block; width: 1.15rem; height: 1.15rem; background: var(--blue); border: 2px solid var(--ink); box-shadow: 3px 3px 0 var(--yellow); }
+.tabs { display: flex; gap: .25rem; margin-left: auto; align-items: center; }
+.tabs button { white-space: nowrap; font: inherit; font-family: var(--mono); font-size: .8rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; border: 2px solid transparent; background: transparent; color: var(--ink); padding: .4rem .8rem; cursor: pointer; min-height: 2.5rem; }
+.tabs button[aria-selected="true"] { background: var(--yellow); color: var(--on-yellow); border-color: var(--rule); }
+.tabs button.theme { border-color: var(--rule); margin-left: .4rem; }
+.tab[hidden] { display: none; }
+table { border-collapse: collapse; width: 100%; font-size: .92rem; }
+th, td { text-align: left; padding: .5rem .7rem; border-bottom: 1px solid var(--soft); vertical-align: top; }
+th { font-family: var(--mono); font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; background: var(--blue); color: var(--on-blue); }
+.num { font-variant-numeric: tabular-nums; }
+.tablewrap { border: 2px solid var(--rule); overflow-x: auto; background: var(--panel); }
+.status { background: var(--note); border: 2px solid var(--yellow); padding: .9rem 1.1rem; font-size: .95rem; }
+.status b { color: var(--yt); font-family: var(--mono); text-transform: uppercase; letter-spacing: .05em; }
+.panel { border: 2px solid var(--rule); box-shadow: 6px 6px 0 var(--ghost); padding: 1.1rem; background: var(--panel); }
+.picker { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+.picker button, .btn { font: inherit; font-family: var(--mono); font-size: .8rem; font-weight: 700; border: 2px solid var(--rule); background: var(--bg); color: var(--ink); padding: .45rem .85rem; min-height: 2.5rem; cursor: pointer; box-shadow: 3px 3px 0 var(--rule); }
+.picker button[aria-pressed="true"], .btn.on { background: var(--blue); color: var(--on-blue); }
+.btn.go { background: var(--yellow); color: var(--on-yellow); }
+.btn:disabled { opacity: .4; cursor: default; box-shadow: none; }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; }
+.trio { display: grid; grid-template-columns: repeat(3, 1fr); gap: .7rem; }
+@media (max-width: 760px) { .pair, .trio { grid-template-columns: 1fr; } }
+.state { border: 2px solid var(--rule); padding: .8rem 1rem; min-height: 5.2rem; background: var(--panel2); }
+.state.today { background: var(--bad-bg); border-color: var(--redt); } .state.fixed { background: var(--good-bg); border-color: var(--link); }
+.state.main { background: var(--note); border-color: var(--yellow); } .state.ours { background: var(--good-bg); border-color: var(--link); }
+.state .label { font-family: var(--mono); font-size: .78rem; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+.chips { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .4rem; min-height: 1.9rem; }
+.chip { background: var(--bg); border: 2px solid var(--rule); padding: .1rem .65rem; font-weight: 700; font-family: var(--mono); font-size: .92rem; }
+.bars { display: flex; flex-direction: column; gap: .55rem; }
+.barrow { display: grid; grid-template-columns: 8.5rem 1fr; gap: .2rem .7rem; align-items: center; font-size: .9rem; margin-bottom: .4rem; }
+.track { background: var(--bg); border: 2px solid var(--rule); height: 1.7rem; position: relative; overflow: hidden; }
+.fill { height: 100%; min-width: 4px; }
+.fill.today { background: var(--muted); } .fill.first { background: var(--red); } .fill.final { background: var(--blue); } .fill.yellow { background: var(--yellow); }
+.val { grid-column: 2; font-family: var(--mono); font-size: .8rem; font-weight: 700; margin-top: -.25rem; overflow-wrap: anywhere; }
+.step-note { min-height: 3rem; }
+footer { padding-block: 2rem; border-top: 2px solid var(--rule); background: var(--panel); }
+.tl { list-style: none; padding: 0; gap: 0; border-left: 4px solid var(--yellow); }
+.tl li { padding: .2rem 0 .9rem 1.2rem; position: relative; }
+.tl li::before { content: ""; position: absolute; left: -.72rem; top: .55rem; width: .9rem; height: .9rem; background: var(--blue); border: 2px solid var(--ink); }
+.tl .when { font-family: var(--mono); font-size: .8rem; color: var(--redt); font-weight: 700; display: block; }
+.tl li.now::before { background: var(--red); }
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: .9rem; }
+@media (max-width: 860px) { .cards { grid-template-columns: 1fr; } }
+.card { border: 2px solid var(--rule); background: var(--panel); padding: 1rem 1.1rem; box-shadow: 5px 5px 0 var(--ghost); display: flex; flex-direction: column; gap: .5rem; }
+.card .tag { font-family: var(--mono); font-size: .75rem; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.card.orig { border-top: 8px solid var(--yellow); } .card.theirs { border-top: 8px solid var(--muted); } .card.mine { border-top: 8px solid var(--red); }
+.card button.lnk, .card a { font: inherit; font-weight: 700; color: var(--link); background: none; border: 0; padding: 0; text-align: left; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
+.lede { font-size: 1.15rem; }
+/* hero */
+.hero { padding-block: clamp(2rem, 6vw, 4rem); }
+.hero h1 { font-size: clamp(2.2rem, 6vw, 3.6rem); }
+.display { font-family: var(--sans); font-weight: 700; font-size: clamp(2.6rem, 11vw, 6.2rem); letter-spacing: -.035em; line-height: 1; text-shadow: 5px 5px 0 var(--ghost); display: flex; flex-wrap: wrap; gap: .1em .25em; align-items: baseline; }
+.display .from { color: var(--redt); } .display .to { color: var(--yt); } .display .arrow { color: var(--muted); }
+.display small { font-size: .95rem; line-height: 1.4; font-family: var(--mono); letter-spacing: 0; text-shadow: none; color: var(--muted); font-weight: 400; width: 100%; }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; border: 2px solid var(--rule); background: var(--panel); }
+.stats div { padding: .8rem 1rem; border-right: 2px solid var(--rule); } .stats div:last-child { border-right: 0; }
+.stats strong { display: block; font-size: 1.5rem; line-height: 1.15; font-variant-numeric: tabular-nums; font-family: var(--mono); }
+@media (max-width: 860px) { .stats { grid-template-columns: 1fr 1fr; } .stats div:nth-child(2) { border-right: 0; } .stats div:nth-child(-n+2) { border-bottom: 2px solid var(--rule); } }
+.sec { display: grid; grid-template-columns: 4.5rem 1fr; gap: 1rem; max-width: 1040px; margin-inline: auto; }
+.secnum { position: relative; font-family: var(--mono); font-weight: 700; } .secnum span { position: sticky; top: 4.2rem; display: inline-block; background: var(--red); color: var(--on-blue); width: 2.6rem; height: 2.6rem; border-radius: 50%; text-align: center; line-height: 2.6rem; font-size: .95rem; }
+.secnum i { position: absolute; left: 1.28rem; top: 2.6rem; bottom: -2.8rem; width: 2px; background: var(--red); }
+.secbody { display: flex; flex-direction: column; gap: 1.1rem; min-width: 0; }
+.secbody > .wrap { padding-left: 0; padding-right: 0; }
+.secbody section { padding-block: 0; border: 0; } .secbody section + section { border: 0; }
+.secbody .col, .secbody .wide { max-width: none; }
+@media (max-width: 640px) { .bar-in { flex-wrap: wrap; gap: .3rem; } .tabs { width: 100%; margin-left: 0; flex-wrap: wrap; } .tabs button { padding: .35rem .55rem; font-size: .74rem; } }
+@media (max-width: 760px) { .sec { grid-template-columns: 1fr; gap: .4rem; } .secnum { display: none; } .barrow { grid-template-columns: 1fr; } .val { grid-column: 1; margin-top: 0; } }
+.subnav { display: flex; flex-wrap: wrap; gap: .5rem; padding-block: 1rem; max-width: 1040px; margin-inline: auto; }
+.subnav a { font-family: var(--mono); font-size: .78rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; border: 2px solid var(--rule); padding: .35rem .7rem; text-decoration: none; color: var(--ink); background: var(--panel); }
+.subnav a::before { content: "[ "; color: var(--redt); } .subnav a::after { content: " ]"; color: var(--redt); }
+svg { max-width: 100%; height: auto; display: block; }
+svg text { font-family: var(--mono); fill: var(--ink); }
+.vz { border: 2px solid var(--rule); background: var(--panel); padding: .8rem; }
+.cellbox { fill: var(--panel2); stroke: var(--soft); stroke-width: 1.5; } .cellbox.read { fill: var(--red); stroke: var(--rule); } .cellbox.one { fill: var(--blue); stroke: var(--rule); } .cellbox.hit { fill: var(--yellow); stroke: var(--rule); }
+.node rect { fill: var(--panel2); stroke: var(--rule); stroke-width: 2; } .node.hot rect { fill: var(--bad-bg); stroke: var(--redt); stroke-width: 3; } .node.fix rect { fill: var(--good-bg); stroke: var(--link); }
+.node text.sub { fill: var(--muted); font-size: 11px; } .edge { stroke: var(--rule); stroke-width: 2; fill: none; }
+.legend { display: flex; flex-wrap: wrap; gap: .4rem 1rem; font-family: var(--mono); font-size: .76rem; color: var(--muted); }
+.legend i { display: inline-block; width: .8rem; height: .8rem; margin-right: .35rem; border: 2px solid var(--rule); vertical-align: -.1rem; }
+.clock { font-family: var(--mono); font-weight: 700; }
+.strip text { font-size: 12px; } .strip .ev rect { fill: var(--panel2); stroke: var(--rule); stroke-width: 2; } .strip .ev.off { opacity: .22; }
+</style>
+</head>
+<body>
+<header class="bar"><div class="wrap"><div class="wide bar-in">
+  <span class="brand"><b aria-hidden="true"></b>selective-undo</span>
+  <nav class="tabs" role="tablist" aria-label="Page sections">
+    <button role="tab" id="t-over" aria-selected="true" aria-controls="p-over">Overview</button>
+    <button role="tab" id="t-tech" aria-selected="false" aria-controls="p-tech">Technical details</button>
+    <button class="theme" id="theme" type="button" aria-label="Switch theme">Theme</button>
+  </nav>
+</div></div></header>
+<main>
+<div class="tab" id="p-over" role="tabpanel" aria-labelledby="t-over">
+<section class="wrap hero"><div class="wide stack">
+  <p class="eyebrow">[ Tilo resource store · collaborative undo ]</p>
+  <div class="display" role="img" aria-label="One undo on 10,000 changes: 26.0 seconds before, 33 milliseconds after"><span class="from">26.0 s</span><span class="arrow">→</span><span class="to">33 ms</span><small>one Store::undo on a document with 10,000 small changes, upstream main without and with a one-function fix</small></div>
+  <h1>Collaborative undo in Tilo: a design, a benchmark and three fixes in upstream's own</h1>
+  <p class="lede">When several people edit the same thing, undo should take back your action and keep what others did since. I built and benchmarked that for Tilo's resource store. When the maintainers landed their own version of the core idea, I carried the same benchmark and tests over to their code. That found a 26-second slowdown in <code>Store::undo</code> (issue #5993, fixed in one function) and two cases where the revert leaves the wrong state: a counter step that is not taken back beside another author's, and a replaced map's old key that comes back. Both are repaired.</p>
+  <div class="stats" role="group" aria-label="Headline results">
+    <div><strong>26.0 s → 33 ms</strong><span class="muted small">one undo, 10,000 changes, with the fix</span></div>
+    <div><strong>6 of 27 → 0</strong><span class="muted small">revert scenario tests failing on upstream main, without and with the fix</span></div>
+    <div><strong>678 → 1</strong><span class="muted small">original work: generated histories (of 1,300) that broke undo</span></div>
+    <div><strong>0 of 1,300</strong><span class="muted small">upstream's own undo on the same benchmark</span></div>
+  </div>
+  <div class="status" id="status"><b>Status.</b> Issue <a href="https://code.tilo.so/tilo/tilo/issues/5993" id="issue-link">#5993</a> is filed and open. <span data-link="perfPr">The speed fix is ready as a pull request.</span> <span data-link="corrIssue">The correctness issue is ready to file.</span> <span data-link="corrPr">Its pull request is ready to open.</span> Nothing has been accepted or merged upstream yet.</div>
+</div></section>
+<section class="wrap"><div class="wide stack">
+  <p class="eyebrow">[ Run it ]</p>
+  <h2>One undo, upstream main against the fix</h2>
+  <p>Press run. Both clocks start together and run for the measured median of that case. This replays recorded medians from a release build, it is not a live system.</p>
+  <div class="panel stack" id="race">
+    <div class="picker" id="r-items" role="group" aria-label="Items"></div>
+    <div class="picker" id="r-shape" role="group" aria-label="Shape"></div>
+    <div class="picker"><button class="btn go" id="r-run">Run undo</button><button class="btn" id="r-skip">Skip ahead</button><span class="muted small" id="r-note"></span></div>
+    <div class="bars">
+      <div class="barrow"><span>Upstream main</span><div class="track"><div class="fill first" id="r-a" style="width:0"></div></div><span class="val"><span class="clock" id="r-ta">0 ms</span> of <span id="r-fa"></span></span></div>
+      <div class="barrow"><span>With the fix</span><div class="track"><div class="fill final" id="r-b" style="width:0"></div></div><span class="val"><span class="clock" id="r-tb">0 ms</span> of <span id="r-fb"></span></span></div>
+    </div>
+  </div>
+</div></section>
+<section class="wrap"><div class="wide stack">
+  <p class="eyebrow">[ Attribution ]</p><h2>Who did what</h2>
+  <div class="cards">
+    <div class="card orig"><span class="tag">Mine · 20 to 23 Nov</span><h3>My original work</h3><p class="small muted">20 to 23 Nov. A selective undo built on Tilo's revert, with a generated-history benchmark, 86 tests and fixes in the revert itself. Kept in <code>historical/</code>.</p><button class="lnk" data-goto="tech" data-anchor="sec-original">Open</button></div>
+    <div class="card theirs"><span class="tag">Tilo · 24 Nov</span><h3>Tilo's own change</h3><p class="small muted">24 Nov, by the maintainers. <code>Store::undo</code> calls the history's revert and the history engine moved into the store crate. It confirmed the direction, and it is the code I tested next.</p><button class="lnk" data-goto="tech" data-anchor="sec-upstream">How it evolved</button></div>
+    <div class="card mine"><span class="tag">Mine · 24 Nov</span><h3>My latest contributions</h3><p class="small muted">On that code: a 26-second lookup fixed in one function, and two state bugs in the revert, found by carrying the benchmark and tests over.</p><button class="lnk" data-goto="tech" data-anchor="sec-speed">Open</button></div>
+  </div>
+</div></section><section class="wrap"><div class="wide stack">
+  <p class="eyebrow">[ Timeline ]</p><h2>How it went</h2>
+  <ol class="tl">
+    <li><span class="when">20 to 23 Nov</span><b>Found the problem and built a solution.</b> Tilo's undo took back other people's later edits: 678 of 1,300 generated histories broke. I built an undo that reuses Tilo's revert, with a benchmark, 86 tests and fixes in the revert itself.</li>
+    <li><span class="when">24 Nov, 12:47 UTC</span><b>Tilo landed the same core idea.</b> Their <code>Store::undo</code> calls the history's revert directly, with no hook. That was the direction my design argued for, so I moved from proposing a hook to testing their implementation.</li>
+    <li class="now"><span class="when">24 Nov</span><b>Carried the benchmark over.</b> The generator reports 0 failures on their undo. The latency test finds 26 seconds for one undo on a large document.</li>
+    <li class="now"><span class="when">24 Nov</span><b>Fixed the lookup.</b> The cause is a quadratic history lookup on the undo path. Issue #5993 describes it, and a one-function change brings one undo to 33 ms with the same correctness results.</li>
+    <li class="now"><span class="when">24 Nov</span><b>Carried the revert scenario tests over.</b> 6 of 27 fail on upstream main: a counter step that is not taken back, a replaced map's old key that comes back, and a wrong report for list counters. With the revert fix all 27 pass. The issue (#5995) and pull request (#5996) are open.</li>
+  </ol></div></section>
+</div>
+<div class="tab" id="p-tech" role="tabpanel" aria-labelledby="t-tech" hidden>
+<nav class="subnav wrap" aria-label="Technical details sections"><a href="#sec-path">Undo path</a><a href="#sec-speed">Speed</a><a href="#sec-correct">Correctness</a><a href="#sec-original">Original work</a><a href="#sec-upstream">Upstream</a><a href="#sec-repro">Reproduce</a><a href="#sec-status">Status</a></nav><section class="wrap sec" id="sec-path"><div class="secnum"><span>01</span><i></i></div><div class="secbody"><p class="eyebrow">[ How undo works ]</p><h2>The undo path in upstream today</h2><p>Since <code>dd0f8bbc37</code>, <code>Store::undo</code> takes back an invocation by calling the history's revert for each document it changed. The revert finds the invocation, computes the inverse, decides per patch whether to write it or keep another author's value, and writes one change. The two findings below sit at two different points of this path.</p><div class="vz"><svg viewBox="0 0 860 250" role="img" aria-label="Store::undo calls revert_stamped for each document, which calls first_index_after, then plans the inverse, classifies each patch and writes one change">
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="currentColor" style="color:var(--ink)"/></marker></defs>
+  <g class="node"><rect x="10" y="85" width="150" height="70"/><text x="85" y="115" text-anchor="middle" font-size="14" font-weight="700">Store::undo</text><text class="sub" x="85" y="136" text-anchor="middle">one invocation</text></g>
+  <path class="edge" d="M160 120 H200" marker-end="url(#ar)"/>
+  <g class="node"><rect x="200" y="85" width="170" height="70"/><text x="285" y="112" text-anchor="middle" font-size="14" font-weight="700">revert_stamped</text><text class="sub" x="285" y="134" text-anchor="middle">per document</text></g>
+  <path class="edge" d="M370 120 H410" marker-end="url(#ar)"/>
+  <g class="node hot"><rect x="410" y="10" width="200" height="70"/><text x="510" y="38" text-anchor="middle" font-size="14" font-weight="700">first_index_after</text><text class="sub" x="510" y="58" text-anchor="middle">find the invocation</text><text x="510" y="74" text-anchor="middle" font-size="11" style="fill:var(--redt)">26.0 s at 10,000 changes</text></g>
+  <path class="edge" d="M390 105 L410 55" marker-end="url(#ar)"/>
+  <g class="node"><rect x="410" y="95" width="200" height="60"/><text x="510" y="122" text-anchor="middle" font-size="14" font-weight="700">inverse patches</text><text class="sub" x="510" y="140" text-anchor="middle">plan the undo</text></g>
+  <g class="node fix"><rect x="410" y="170" width="200" height="70"/><text x="510" y="196" text-anchor="middle" font-size="14" font-weight="700">classify</text><text class="sub" x="510" y="214" text-anchor="middle">takes_back, or keep theirs</text><text x="510" y="231" text-anchor="middle" font-size="11" style="fill:var(--link)">counter and map fixes</text></g>
+  <path class="edge" d="M370 130 L410 190" marker-end="url(#ar)"/>
+  <path class="edge" d="M610 190 H650" marker-end="url(#ar)"/>
+  <g class="node"><rect x="650" y="150" width="200" height="80"/><text x="750" y="182" text-anchor="middle" font-size="14" font-weight="700">write one change</text><text class="sub" x="750" y="204" text-anchor="middle">other authors' work kept</text></g>
+</svg><div class="legend"><span><i style="background:var(--bad-bg)"></i>speed fix (#5993)</span><span><i style="background:var(--good-bg)"></i>correctness fix</span></div></div></div></section><section class="wrap sec" id="sec-speed"><div class="secnum"><span>02</span><i></i></div><div class="secbody"><p class="eyebrow">[ Finding 1 · speed · issue #5993 filed ]</p><h2>Where the 26 seconds go</h2><p>Upstream's change made <code>Store::undo</code> take back an invocation by calling the history's revert in each document. Part of that revert, <code>first_index_after</code>, finds where an invocation sits in a document's history. It rebuilt the heads of every prefix, and each rebuild read all change metadata, so one undo cost time quadratic in the number of changes. The function predates the change, and the new undo put it on the path of every undo.</p><div class="vz stack" id="scanbox">
+  <p class="small muted">A history of changes. To find where the invocation sits, upstream rebuilt the heads of every prefix, rereading all earlier changes each time. The fix keeps the heads while it walks the history once. Shown with a small history, the measured times for large ones are in the race above.</p>
+  <div class="picker"><button class="btn go" id="s-play">Play</button><button class="btn" id="s-reset">Reset</button><label class="small muted">Changes <input type="range" id="s-n" min="8" max="40" value="24"></label></div>
+  <svg id="s-svg" viewBox="0 0 860 190" role="img" aria-label="Cell diagram of the lookup, rereads highlighted"></svg>
+  <div class="legend"><span><i style="background:var(--red)"></i>read again</span><span><i style="background:var(--blue)"></i>read once</span><span id="s-count" class="clock"></span></div>
+</div><div class="stack">
+  
+  <h3>Measured, all sizes</h3>
+  <p>Median of 31 undos. "Many small changes" means the document was built by that many separate invocations. "One change" means a single invocation wrote all its entries. Pick a size and shape:</p>
+</div>
+<div style="margin-top:.4rem"><div class="panel stack">
+  <div class="picker" id="n-items" role="group" aria-label="Items"></div>
+  <div class="picker" id="n-shape" role="group" aria-label="Shape"></div>
+  <div class="bars" id="nlat" aria-live="polite"></div>
+  <p class="small muted">Bars use a log scale, so a bar twice as long is not twice the time. Read the labels for the real comparison.</p>
+</div></div>
+<div class="col stack" style="margin-top:1rem">
+  <p>Two things stand out. Upstream's undo is much faster when the document was written in one change. When it was written in many, it grows with the square of the history: ten times more changes took about 96 times longer (272 ms to 26.0 s). With the repair, ten times more changes take about ten times longer.</p>
+  <p class="small muted"><b>Conditions.</b> Release build, run alone, on a laptop under load (macOS storage services at 85 to 163% of a core, load average 5 to 7), so treat the absolute numbers as indicative. The old-store column was measured earlier on the same machine. The gap between 26 s and 0.6 s is far larger than that noise.</p>
+</div><div class="stack">
+  <h2>The repair</h2>
+  <p>The heads of a prefix change in a simple way when the prefix grows by one change: that change's dependencies stop being heads, and the change itself becomes one. Keeping the set as the loop advances removes the repeated rebuilding. This is the whole change, in <code>crates/core/resource-store/src/history/revert.rs</code>:</p>
+<pre><code>- for i in 0..total {
+-     let hs: HashSet&lt;ChangeHash&gt; = prefix_heads(doc, i).into_iter().collect();
+-     if hs == after_set { return i + 1; }
+- }
++ let mut heads: HashSet&lt;ChangeHash&gt; = HashSet::new();
++ for (i, meta) in doc.get_changes_meta(&amp;[]).iter().take(total).enumerate() {
++     for dep in &amp;meta.deps { heads.remove(dep); }
++     heads.insert(meta.hash);
++     if heads == after_set { return i + 1; }
++ }</code></pre>
+  <p>The lookup returns the same index as before. In these measurements the cost grows about tenfold for ten times the changes.</p>
+</div></div></section><section class="wrap sec" id="sec-correct"><div class="secnum"><span>03</span><i></i></div><div class="secbody"><p class="eyebrow">[ Finding 2 · correctness · issue #5995 and pull request #5996 open ]</p><div class="stack">
+  
+  <h2>Two places where upstream's revert leaves the wrong state</h2>
+  <p>I carried my revert, merge and counter scenario tests over to upstream's code (27 tests). 6 fail on unmodified main and none with the fix in <code>revert.rs</code>. My text and counter generator gates (1,000 seeded histories each) pass on upstream too, but every history in them has one author, so none puts a second person's step on the same counter. Press the buttons in order. The panels replay results recorded from the tests.</p>
+  <h3>1. Undoing a counter increment does nothing once someone else changed the counter</h3>
+</div>
+<div class="wide" style="margin-top:1rem"><div class="panel stack" id="demo-counter">
+  <div class="vz"><svg class="strip" id="k-strip" role="img" aria-label="Counter events"></svg></div><div class="picker" role="group" aria-label="Counter actions">
+    <button class="btn" id="k-ada">Ada adds 5</button>
+    <button class="btn" id="k-ben" disabled>Ben adds −2</button>
+    <button class="btn" id="k-undo" disabled>Ada undoes her 5</button>
+    <button class="btn" id="k-reset">Reset</button>
+  </div>
+  <div class="pair">
+    <div class="state main"><div class="label">Upstream main</div><div class="chips" id="k-main" aria-live="polite"></div></div>
+    <div class="state ours"><div class="label">With the fix</div><div class="chips" id="k-fix" aria-live="polite"></div></div>
+  </div>
+  <p class="small muted step-note" id="k-note"></p>
+</div></div>
+<div class="col stack" style="margin-top:1rem">
+  <p>Increments add up, so Ben's −2 does not overwrite Ada's 5, and her 5 can be taken back without touching his −2. Upstream treats his change as an overwrite, reports the slot as kept and writes nothing. It needs a second author: on a plain document it fails whether his step comes later or at the same time, and with two synced stores (Ada in one, Ben in the other) <code>Store::undo</code> leaves 3. In one store where his step is simply the next invocation, <code>Store::undo</code> already gives −2, so that sequential case is fine. Tests: <code>an_increment_is_taken_back_beside_another_authors_increment</code>, <code>a_concurrent_increment_by_another_author_is_kept</code> and the two-store test <code>undoing_a_counter_step_beside_a_peers_step_keeps_theirs</code>. Tilo's counter app (<code>apps/tl/counter/app.tl</code>) uses this kind of field.</p>
+  <h3>2. A replaced map's old key comes back</h3>
+</div>
+<div class="wide" style="margin-top:1rem"><div class="panel stack" id="demo-map">
+  <div class="vz"><svg class="strip" id="m-strip" role="img" aria-label="Map events"></svg></div><div class="picker" role="group" aria-label="Map actions">
+    <button class="btn" id="m-run">A run replaces map m</button>
+    <button class="btn" id="m-ben" disabled>Ben writes b into the new m</button>
+    <button class="btn" id="m-undo" disabled>Undo the run</button>
+    <button class="btn" id="m-reset">Reset</button>
+  </div>
+  <div class="pair">
+    <div class="state main"><div class="label">Upstream main</div><div class="chips" id="m-main" aria-live="polite"></div></div>
+    <div class="state ours"><div class="label">With the fix</div><div class="chips" id="m-fix" aria-live="polite"></div></div>
+  </div>
+  <p class="small muted step-note" id="m-note"></p>
+</div></div>
+<div class="col stack" style="margin-top:1rem">
+  <p>The new map stays after the undo because Ben wrote inside it, and that part is right. But upstream writes the inverse of the replacement into it, and with it the older map's key <code>k</code>. Test: <code>a_map_the_run_put_over_an_older_one_keeps_its_replacement_free_of_the_older_keys</code>.</p>
+  <h3>3. Reporting only: a list counter another author replaced or deleted</h3>
+  <p>Undo correctly writes nothing and keeps their value, but reports 0 slots kept instead of 1. Nothing is lost, so I count this separately from the two above. Two tests cover it (<code>a_list_counter_another_author_replaced_is_kept</code> and <code>..._deleted_is_kept_and_nothing_is_written</code>).</p>
+  <div class="tablewrap"><table><thead><tr><th>Scenario</th><th>Upstream main</th><th>With the fix</th></tr></thead><tbody>
+    <tr><td>Counter 0, Ada +5, Ben −2, Ada undoes</td><td class="num">3 (nothing written)</td><td class="num">−2</td></tr>
+    <tr><td>Same, Ben's change made at the same time and merged</td><td class="num">3 (nothing written)</td><td class="num">−2</td></tr>
+    <tr><td>Same, two synced stores, <code>Store::undo</code></td><td class="num">3</td><td class="num">−2</td></tr>
+    <tr><td>Same, one store, Ben's step is the next invocation</td><td class="num">−2 (already correct)</td><td class="num">−2</td></tr>
+    <tr><td>Replaced map {k: old} → {a}, Ben adds b, undo</td><td><code>{a, b, k: "old"}</code></td><td><code>{a, b}</code></td></tr>
+    <tr><td>List counter replaced by another author</td><td class="num">reports 0 kept</td><td class="num">reports 1 kept</td></tr>
+    <tr><td>List counter deleted by another author</td><td class="num">reports 0 kept</td><td class="num">reports 1 kept</td></tr>
+    <tr><td>All 27 revert and merge scenario tests</td><td class="num">21 pass, 6 fail</td><td class="num">27 pass</td></tr>
+  </tbody></table></div>
+  <p>The repair is 85 lines added and 5 removed in <code>revert.rs</code>. It tracks increments apart from overwrites, names a list element by its cursor, and holds back keys under a container that stays. It keeps upstream's design (<code>revert_stamped</code>, <code>takes_back</code>) as it is. The whole change is <code>current/corr-pr.patch</code> (<code>revert.rs</code>, two <code>mod</code> lines in the existing <code>tests/it.rs</code> and the two new test files, as in pull request #5996). The <code>revert.rs</code> part alone is <code>current/corr-revert-main.diff</code>, the tests are in <code>current/corr-tests/</code>. The fixes carry over from the revert changes in my original work.</p>
+</div></div></section><section class="wrap sec" id="sec-checks"><div class="secnum"><span>04</span><i></i></div><div class="secbody"><p class="eyebrow">[ Evidence ]</p><div class="stack">
+  <h2>What was checked</h2>
+  <ul>
+    <li><b>Correctness benchmark.</b> A seeded generator builds 2,000 edit histories, 1,300 of them where undoing one action must equal replaying the history without it. Upstream's undo reports 0 failures, and so does upstream with either fix or both.</li>
+    <li><b>Tests.</b> All <code>tilo-resource-store</code> tests pass with the fixes: 22 in the library and 59 integration tests. The 27 revert scenario tests pass with the correctness fix, and 6 of them fail without it.</li>
+    <li><b>Other crates that call the revert.</b> <code>tilo-collaboration</code> document tests (17), <code>tilo-ui</code> history tests (38) and the UI test <code>undo_the_agents_work</code> pass.</li>
+    <li><b>Format and lint.</b> rustfmt is clean and Clippy <code>-D warnings</code> passes on the store library and the new test files.</li>
+    <li><b>Current main.</b> The scenario tests, the generator, the full store suite, rustfmt and Clippy were rerun on upstream main <code>21936d4e81</code> (24 Nov): 6 of 27 fail without the correctness fix, none with it, and the generator reports 0 of 1,300 in every variant.</li>
+  </ul>
+  <p class="small muted">Environment and verification details are in <code>TECHNICAL.md</code>. Reproduce the measurement with <code>current/undo_latency.rs</code>, and the correctness benchmark with <code>current/selective_undo.rs</code> (steps in <code>current/README.md</code>). The exact change is <code>current/first-index-after-one-pass.diff</code>.</p>
+</div></div></section><section class="wrap sec" id="sec-original"><div class="secnum"><span>05</span><i></i></div><div class="secbody"><p class="eyebrow">[ Original work · 20 to 23 Nov ]</p><div class="stack">
+  
+  <p>This is the investigation and implementation from 20 to 23 Nov, on Tilo as it was then. The code is kept in <code>historical/patch/</code>. I kept it private while I prepared it, and Tilo landed its own version first. The numbers on this tab are for Tilo at commit <code>2fcb9946fe</code>, not for today's main.</p>
+</div><div class="stack">
+  <h2>The problem, in Chat</h2>
+  <p>Chat stores a message's reactions in one map. The old undo put the whole map back the way it was before Ada's reaction. That was empty, so Ben's reaction went too. Press the buttons in order. The panels show the old store undo, my undo, and what upstream's new undo does today.</p>
+</div>
+<div style="margin-top:.4rem"><div class="panel stack" id="demo">
+  <div class="picker" role="group" aria-label="Actions">
+    <button class="btn" id="b-cy" aria-pressed="false">Cy reacted earlier</button>
+    <button class="btn" id="b-ada">Ada reacts</button>
+    <button class="btn" id="b-ben" disabled>Ben reacts</button>
+    <button class="btn" id="b-undo" disabled>Ada undoes</button>
+    <button class="btn" id="b-reset">Reset</button>
+  </div>
+  <div class="trio">
+    <div class="state today"><div class="label">Old store undo</div><div class="chips" id="c-today" aria-live="polite"></div></div>
+    <div class="state ours"><div class="label">My undo</div><div class="chips" id="c-fixed" aria-live="polite"></div></div>
+    <div class="state main"><div class="label">Upstream main (24 Nov)</div><div class="chips" id="c-main" aria-live="polite"></div></div>
+  </div>
+  <p class="small muted step-note" id="note">This panel replays results recorded in tests, it is not a live system. Setup: two stores that sync, driven by the commands a Chat reaction sends. Upstream's undo never loses Ben's reaction, but when Ada's reaction created the map, her own undo does nothing. My undo removed hers exactly. On upstream it is a refinement, not data loss.</p>
+</div></div><div class="stack">
+  <h2>A benchmark for the property</h2>
+  <p>One example is not enough, so a test generator builds 2,000 random histories of edits to maps, lists, nested objects, text and counters. For each one it undoes an edit and compares the result with a replay of the same history that never contained that edit. When no later edit depended on the undone one, the two must match. That applies to 1,300 of the histories.</p>
+  <div class="bars" id="bench" aria-label="Histories that break the property"></div>
+  <p class="small muted">My undo's one remaining case is a list-order choice: a restored list item goes back after its old neighbour, which is what Tilo's own test expects. Upstream's undo reports 0 on the same generator, which I ported to its new code layout.</p>
+</div><div class="stack">
+  <h2>The earlier performance journey</h2>
+  <p>My first version of the undo took 33 s for one undo on a document with 10,000 items and 10,000 small changes. The store's undo at the time took 0.60 s, so it was about 55 times slower. Most of the time was in the <code>first_index_after</code> lookup that already existed in Tilo's revert. Making it a single pass brought my version to 0.19 s. It is the same repair that later fixed upstream's 26-second undo.</p>
+</div>
+<div style="margin-top:.4rem"><div class="panel stack">
+  <div class="picker" id="p-items" role="group" aria-label="Items"></div>
+  <div class="picker" id="p-shape" role="group" aria-label="Shape"></div>
+  <div class="bars" id="lat" aria-live="polite"></div>
+  <p class="small muted">Median per undo, log-scale bars. "Store's undo then" is the store's undo at that time. Run on Tilo at <code>2fcb9946fe</code>, with the machine busy (storage services 108 to 174% of a core, load 6 to 14), so indicative only.</p>
+</div></div><div class="stack">
+  <h2>What was built</h2>
+  <ul>
+    <li><b>Undo reuses Tilo's revert.</b> An optional <code>ContentUndo</code> hook in the resource store, with the workspace service plugging in <code>revert_changes</code>. At the time the store sat below the collaboration crate, so the hook was injected. A multi-document undo is rolled back if a later document fails, and that rollback can itself fail.</li>
+    <li><b>Fixes in the revert itself</b> that the new tests found: counters that several people increment, replaced maps, and the slow lookup.</li>
+    <li><b>A repair caught by Tilo's own test.</b> My first rule for Chat took a block's own keys out of a block someone else had edited. Tilo's existing "undo the agent's work" test failed on a paragraph. I bisected it against upstream, removed the rule, and moved the Chat behaviour into a narrow store rule for flat maps. A review then found two edge cases in that rule (a concurrent write at the same entry, and a map holding an object), which I fixed.</li>
+    <li><b>Concurrent writes.</b> Tests cover an entry another author writes later, and a concurrent write of the same value. A deliberately weakened guard fails exactly that test, so it tests write history and not value equality.</li>
+    <li><b>86 new tests</b> run by default, plus 7 measurements, with 1,000-seed gates in two actor modes.</li>
+  </ul>
+</div></div></section><section class="wrap sec" id="sec-upstream"><div class="secnum"><span>06</span><i></i></div><div class="secbody"><p class="eyebrow">[ How upstream evolved ]</p><div class="stack">
+  <h2>How upstream evolved</h2>
+  <p>On 24 Nov at 12:47 UTC the maintainers landed two commits. <code>a6758222e2</code> moved the history engine, the revert and the undo log into the resource-store crate. <code>dd0f8bbc37</code> made <code>Store::undo</code> take back an invocation by calling that revert in each document it changed, and removed the store's own old undo and its key copy. They did this independently: nothing of mine had been filed or shared.</p>
+  <p>Moving the history engine into the store removed the layering problem my hook worked around, so the hook was no longer needed. It confirmed the direction and gave me the code to test next. What was mine and what was theirs:</p>
+  <div class="tablewrap"><table><thead><tr><th></th><th>My original work</th><th>Upstream's change</th></tr></thead><tbody>
+    <tr><td>Core idea</td><td>Undo through Tilo's revert</td><td>The same, with the history engine moved into the store crate</td></tr>
+    <tr><td>How it connects</td><td>An injected <code>ContentUndo</code> hook</td><td>A direct call, no hook</td></tr>
+    <tr><td>Correctness benchmark</td><td>1 of 1,300 fails</td><td>0 of 1,300 fail</td></tr>
+    <tr><td>Chat: Ada reacted first</td><td>Ada's removed, Ben's stays (store rule)</td><td>Both stay; Ada's undo does nothing</td></tr>
+    <tr><td>Undo speed, many small changes</td><td>0.19 s at 10,000 (after the lookup repair)</td><td>26.0 s at 10,000; 33 ms with the repair</td></tr>
+  </tbody></table></div>
+</div><div class="stack">
+  <h2>Adapting the work</h2>
+  <ul>
+    <li><b>Fetched upstream main</b> (commit <code>b06ae3fe8e</code>, 4,158 commits past my base) and exported it as a separate offline build copy, reusing the compiled dependency cache.</li>
+    <li><b>Ported the generator and the latency test</b> to the new layout (<code>crates/core/resource-store</code>). They use only the store's public API, so they ran against upstream's own <code>Store::undo</code> with no hook. The Chat probe needed one change: a stricter store now refuses changes for a type it has not declared, so the probe declares the type.</li>
+    <li><b>Ran them, found the 26 seconds,</b> then applied only the one-pass lookup to upstream and re-measured and re-tested.</li>
+    <li><b>Checked the report before filing:</b> duplicates on Tilo's Forgejo, whether <code>main</code> had moved, and that the reproduction test in the issue compiles.</li>
+  </ul>
+</div><div class="stack">
+  <h2>Scope and limits</h2>
+  <ul>
+    <li><b>Chat reaction on upstream main.</b> If Ada's reaction created the reaction map, Ben reacts, and Ada undoes, both reactions stay: nothing is lost, but Ada's undo does nothing. With an earlier reaction already in the map, it is exact. A small store rule for flat map fields made the first case exact in my original work. It is documented here and not proposed; it is a refinement, not data loss.</li>
+    <li><b>Automerge behaviour.</b> Writing a value an entry already holds records no operation, so there is no later write for undo to protect. Two people creating the same fresh map at the same time is an Automerge conflict (one map wins), independent of undo.</li>
+    <li><b>My change's boundaries (original work).</b> A person undoing an earlier edit still takes back their own later edit on that field. If another author wrote inside an object the action created, that object stays whole. A restored list item goes back after its old neighbour. The store rule cannot tell a flat attribute map from a flat collection without a schema. Windows with no workspace kept the old undo.</li>
+    <li><b>Measurement conditions.</b> Timings come from a laptop under load, release builds without LTO. They show orders of magnitude and scaling.</li>
+    <li><b>Verification scope.</b> Checks ran in an offline build copy of upstream, outside Tilo's own <code>t</code> build server. <code>TECHNICAL.md</code> lists what ran, on which commit, and what was left to Tilo's CI.</li>
+  </ul>
+</div></div></section><section class="wrap sec" id="sec-repro"><div class="secnum"><span>07</span><i></i></div><div class="secbody"><p class="eyebrow">[ Reproduce ]</p><div class="stack">
+  <h2>Reproduce</h2>
+  <h3>The latest finding, on upstream main</h3>
+<pre><code># in a checkout of Tilo main (b06ae3fe8e), see current/README.md
+cargo test --release -p tilo-resource-store --test undo_latency -- --exact undo_latency --nocapture --test-threads=1
+cargo test --release -p tilo-resource-store --test selective_undo -- --ignored --nocapture</code></pre>
+  <h3>The correctness fixes, on upstream main</h3>
+<pre><code># in a checkout of Tilo main (b06ae3fe8e, or later with revert.rs unchanged), see current/README.md
+git apply $SU/current/corr-pr.patch     # revert.rs, two mod lines in tests/it.rs, two test files
+cargo test -p tilo-resource-store --test it -- revert_focus:: merge_focus::
+# without the patch's revert.rs change, 6 of the 27 tests fail; with it none
+cargo test --release -p tilo-resource-store --test selective_undo -- --ignored --nocapture   # 0 of 1,300</code></pre>
+  <h3>The original correctness benchmark, on the code I started from</h3>
+<pre><code>bash historical/reproduce/run.sh path/to/tilo-checkout   # 2fcb9946fe plus the three patches</code></pre>
+  <p class="small muted">The historical script reproduces the correctness results (678 → 1 of 1,300), not the latency numbers. The latency probe it came from is <code>historical/reproduce/latency/probe_undo_latency.rs</code>, for reference.</p>
+
+</div></div></section><section class="wrap sec" id="sec-status"><div class="secnum"><span>08</span><i></i></div><div class="secbody"><p class="eyebrow">[ Status ]</p><div class="stack">
+  <h2>Status of the contributions</h2>
+  <div class="tablewrap"><table><thead><tr><th>Item</th><th>State</th></tr></thead><tbody>
+    <tr><td>Issue #5993: quadratic <code>first_index_after</code>, 26 s undo on upstream main</td><td>Filed on Tilo's Forgejo, open</td></tr>
+    <tr><td>Pull request with the one-pass lookup</td><td data-link="perfPr">Ready, not opened yet</td></tr>
+    <tr><td>Correctness issue and pull request (counter undo, replaced map, list-counter report)</td><td><span data-link="corrIssue">Issue ready, not filed yet</span> · <span data-link="corrPr">pull request ready, not opened yet</span></td></tr>
+    <tr><td>Original undo hook, revert fixes and generator (three stacked changes)</td><td>Developed privately, superseded by Tilo's own change. Kept in <code>historical/</code></td></tr>
+    <tr><td>Accepted upstream</td><td>Nothing yet</td></tr>
+  </tbody></table></div>
+</div></div></section>
+</div>
+</main>
+<footer class="wrap"><div class="col small muted stack"><div><b>selective-undo</b> · Yash Gupta · <a href="https://github.com/yashgix">github.com/yashgix</a> · <a href="https://www.linkedin.com/in/yash-guptaix/">linkedin.com/in/yash-guptaix</a></div><div>Write-up, page and data are original work (MIT). The patches and test files that link Tilo code are AGPL-3.0-only; see <code>NOTICE.md</code>.</div></div></footer>
+<script>
+
+const DATA = {"original": {"commit": "b0c1734a00", "upstream_base": "2fcb9946fe", "benchmark": {"histories": 2000, "independent": 1300, "today_break": 678, "with_change_break": 1, "replay_errors": 0, "note": "the one remaining case is a list-order choice"}, "latency_median_us": [{"items": 100, "shape": "one_change", "today_us": 4790, "first_hook_us": 2081, "final_hook_us": 1318}, {"items": 100, "shape": "many_changes", "today_us": 5528, "first_hook_us": 9798, "final_hook_us": 2697}, {"items": 1000, "shape": "one_change", "today_us": 43934, "first_hook_us": 5395, "final_hook_us": 4443}, {"items": 1000, "shape": "many_changes", "today_us": 47527, "first_hook_us": 357632, "final_hook_us": 18175}, {"items": 10000, "shape": "one_change", "today_us": 430264, "first_hook_us": 37614, "final_hook_us": 36632}, {"items": 10000, "shape": "many_changes", "today_us": 599339, "first_hook_us": 33118476, "final_hook_us": 188895}], "latency_conditions": "release build without LTO, 2 CPUs, 31 rounds per cell, one undo. macOS storage services used 128 to 152% of a core during the final run, load average about 6. The first-hook column was measured earlier, while a stray process also held a core. Three later runs agree within about 15%.", "reactions": {"setup": "two stores that sync, using the workspace service's undo, driven by the commands a Chat reaction sends", "cases": [{"case": "Ada reacts, Ben reacts, Ada undoes", "today": ["(none)"], "with_change": ["ben"]}, {"case": "Cy reacted earlier, then Ada, then Ben, Ada undoes", "today": ["cy"], "with_change": ["ben", "cy"]}]}, "tests": {"default": 86, "ignored_measurements": 7, "files": {"content_undo": 11, "selective_undo": 5, "selective_revert": 31, "selective_undo_store": 19, "selective_undo_text_counter": 8, "selective_undo_merge": 5, "selective_undo_reactions": 7}}}, "upstream_main": {"commit": "b06ae3fe8e", "landed": "2026-11-24T12:47Z", "commits": ["dd0f8bbc37", "a6758222e2"], "benchmark": {"histories": 2000, "independent": 1300, "p1_violations": 0, "replay_errors": 0}, "reactions": {"ada_first_then_ben": ["ada", "ben"], "cy_earlier": ["ben", "cy"]}}, "current": {"issue": "https://code.tilo.so/tilo/tilo/issues/5993", "issue_number": 5993, "main_commit": "b06ae3fe8e", "old_base": "2fcb9946fe", "latency_median_us": [{"items": 100, "shape": "one_change", "old_store_us": 4790, "main_us": 914, "fixed_us": 309}, {"items": 100, "shape": "many_changes", "old_store_us": 5528, "main_us": 6449, "fixed_us": 637}, {"items": 1000, "shape": "one_change", "old_store_us": 43934, "main_us": 1124, "fixed_us": 508}, {"items": 1000, "shape": "many_changes", "old_store_us": 47527, "main_us": 272337, "fixed_us": 3504}, {"items": 10000, "shape": "one_change", "old_store_us": 430264, "main_us": 3313, "fixed_us": 2874}, {"items": 10000, "shape": "many_changes", "old_store_us": 599339, "main_us": 26030182, "fixed_us": 32646}], "conditions": "release build, 31 rounds per cell, one undo, run alone. During the runs on main the macOS storage services used 85 to 163% of a core and the load average was 5 to 7. The old-store column was measured earlier on the same machine under similar load (load 6 to 14).", "benchmark_after_fix": {"histories": 2000, "independent": 1300, "p1_violations": 0, "replay_errors": 0}, "clippy": "store library passes with -D warnings; unmodified upstream fails in crates/sdk/tilo-doc/src/table_source.rs (3 arithmetic_side_effects errors); that lint allowed in a scratch copy only"}, "correctness": {"main_commit_tested": "b06ae3fe8e", "main_commit_checked_later": "ba62261d8f", "ported_tests": {"total": 27, "fail_on_main": 6, "fail_with_repair": 0, "failing": ["undoing_a_counter_step_beside_a_peers_step_keeps_theirs", "a_concurrent_increment_by_another_author_is_kept", "an_increment_is_taken_back_beside_another_authors_increment", "a_map_the_run_put_over_an_older_one_keeps_its_replacement_free_of_the_older_keys", "a_list_counter_another_author_replaced_is_kept", "a_list_counter_another_author_deleted_is_kept_and_nothing_is_written"], "revert_focus": 23, "merge_focus": 4}, "counter": {"start": 0, "ada": 5, "ben": -2, "after_undo_main": 3, "after_undo_repair": -2}, "replaced_map": {"main": "{a, b, k: old}", "repair": "{a, b}"}, "list_counter_kept_reported": {"main": 0, "repair": 1}, "lines": {"added": 85, "removed": 5}, "status": "drafted locally, not filed", "generator_gate": {"histories": 2000, "independent": 1300, "p1_violations_correctness_only": 0, "p1_violations_combined": 0, "replay_errors": 0}}};
+const ORIG = DATA.original, CUR = DATA.current, MAIN = DATA.upstream_main;
+
+// tabs
+const TABS = ["over", "tech"];
+function show(which, anchor) {
+  for (const key of TABS) {
+    document.getElementById("p-" + key).hidden = (key !== which);
+    document.getElementById("t-" + key).setAttribute("aria-selected", String(key === which));
+  }
+  if (anchor && document.getElementById(anchor)) document.getElementById(anchor).scrollIntoView(); else window.scrollTo({ top: 0 });
+  try { history.replaceState(null, "", "#" + (anchor || which)); } catch (e) {}
+}
+TABS.forEach(k => { document.getElementById("t-" + k).onclick = () => show(k); });
+document.querySelectorAll("[data-goto]").forEach(a => a.onclick = e => { e.preventDefault(); show(a.dataset.goto, a.dataset.anchor); });
+document.querySelectorAll(".subnav a").forEach(a => a.onclick = e => { e.preventDefault(); const id = a.getAttribute("href").slice(1); document.getElementById(id).scrollIntoView(); try { history.replaceState(null, "", "#" + id); } catch (er) {} });
+(function () { const h = (location.hash || "").slice(1); if (h === "tech") show("tech"); else if (h && document.getElementById(h)) { show("tech", h); } })();
+
+// theme: follows the system, the button overrides and remembers
+(function () {
+  const root = document.documentElement, btn = document.getElementById("theme");
+  const sys = () => matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  let saved = null; try { saved = localStorage.getItem("theme"); } catch (e) {}
+  const q = new URLSearchParams(location.search).get("theme"); if (q === "light" || q === "dark") saved = q;
+  if (saved) root.dataset.theme = saved;
+  const cur = () => root.dataset.theme || sys();
+  const label = () => { btn.textContent = cur() === "dark" ? "Light" : "Dark"; };
+  btn.onclick = () => { const next = cur() === "dark" ? "light" : "dark"; root.dataset.theme = next; try { localStorage.setItem("theme", next); } catch (e) {} label(); };
+  label();
+})();
+
+// copy buttons on code blocks
+document.querySelectorAll("pre").forEach(pre => {
+  const b = document.createElement("button"); b.className = "copy"; b.type = "button"; b.textContent = "copy";
+  b.onclick = () => { const t = pre.querySelector("code").innerText; if (navigator.clipboard) navigator.clipboard.writeText(t).then(() => { b.textContent = "copied"; setTimeout(() => b.textContent = "copy", 1500); }, () => {}); };
+  pre.append(b);
+});
+
+// the race: replays recorded medians in real time
+(function () {
+  const rows = DATA.current.latency_median_us; let items = 10000, shape = "many_changes", raf = 0, t0 = 0, A = 0, B = 0;
+  const fmt = us => us >= 1e6 ? (us / 1e6).toFixed(us >= 1e7 ? 1 : 2) + " s" : us >= 1e3 ? (us / 1e3).toFixed(us >= 1e5 ? 0 : 1) + " ms" : us + " µs";
+  const $ = id => document.getElementById(id);
+  const SH = { one_change: "one big change", many_changes: "many small changes" };
+  function pickers() {
+    [["r-items", [100, 1000, 10000].map(n => [n, n.toLocaleString("en-US") + " items"]), () => items, v => items = v], ["r-shape", Object.entries(SH), () => shape, v => shape = v]].forEach(([id, opts, get, set]) => {
+      const el = $(id); el.replaceChildren();
+      opts.forEach(([val, label]) => { const b = document.createElement("button"); b.textContent = label; b.setAttribute("aria-pressed", String(get() === val)); b.onclick = () => { set(val); cancelAnimationFrame(raf); setup(); }; el.append(b); });
+    });
+  }
+  function setup() {
+    pickers();
+    const r = rows.find(x => x.items === items && x.shape === shape); A = r.main_us; B = r.fixed_us;
+    $("r-fa").textContent = fmt(A); $("r-fb").textContent = fmt(B); $("r-a").style.width = "0"; $("r-b").style.width = "0"; $("r-ta").textContent = "0 ms"; $("r-tb").textContent = "0 ms";
+    $("r-note").textContent = A / B >= 2 ? "The fix is " + (A / B).toFixed(A / B >= 10 ? 0 : 1) + "× faster here." : "";
+  }
+  function draw(elapsedUs) {
+    const a = Math.min(elapsedUs, A), b = Math.min(elapsedUs, B);
+    $("r-a").style.width = (100 * a / A) + "%"; $("r-b").style.width = (100 * b / B) + "%"; $("r-ta").textContent = fmt(Math.round(a)); $("r-tb").textContent = fmt(Math.round(b));
+  }
+  function run() {
+    cancelAnimationFrame(raf);
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) { draw(A); return; }
+    t0 = performance.now();
+    const tick = now => { const e = (now - t0) * 1000; draw(e); if (e < A) raf = requestAnimationFrame(tick); };
+    raf = requestAnimationFrame(tick);
+  }
+  $("r-run").onclick = run; $("r-skip").onclick = () => { cancelAnimationFrame(raf); draw(A); };
+  setup();
+})();
+
+// the lookup, as cells
+(function () {
+  const svg = document.getElementById("s-svg"), NS = "http://www.w3.org/2000/svg"; let n = 24, step = -1, timer = 0, readsA = 0, readsB = 0;
+  const count = document.getElementById("s-count");
+  function build() {
+    svg.replaceChildren(); const w = 860, pad = 10, cw = (w - 2 * pad) / n;
+    [["Upstream main: heads rebuilt for every prefix", 20], ["With the fix: one pass, heads kept", 110]].forEach(([label, y], lane) => {
+      const t = document.createElementNS(NS, "text"); t.setAttribute("x", pad); t.setAttribute("y", y); t.setAttribute("font-size", "13"); t.setAttribute("font-weight", "700"); t.textContent = label; svg.append(t);
+      for (let i = 0; i < n; i++) { const r = document.createElementNS(NS, "rect"); r.setAttribute("x", pad + i * cw + 1); r.setAttribute("y", y + 10); r.setAttribute("width", cw - 2); r.setAttribute("height", 38); r.setAttribute("class", "cellbox"); r.dataset.lane = lane; r.dataset.i = i; svg.append(r); }
+    });
+  }
+  function paint() {
+    svg.querySelectorAll("rect").forEach(r => { const lane = +r.dataset.lane, i = +r.dataset.i; let c = "cellbox";
+      if (step >= 0) { if (lane === 0 && i <= step) c += i === step ? " hit" : " read"; if (lane === 1 && i <= step) c += i === step ? " hit" : " one"; }
+      r.setAttribute("class", c); });
+    count.textContent = "metadata reads so far: upstream " + readsA + ", fix " + readsB + (step >= n - 1 ? "  (of " + n + " changes)" : "");
+  }
+  function reset() { clearInterval(timer); timer = 0; step = -1; readsA = readsB = 0; build(); paint(); document.getElementById("s-play").textContent = "Play"; }
+  function advance() { if (step >= n - 1) { clearInterval(timer); timer = 0; document.getElementById("s-play").textContent = "Replay"; return; } step++; readsA += step + 1; readsB += 1; paint(); }
+  document.getElementById("s-play").onclick = () => {
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) { step = n - 1; readsA = n * (n + 1) / 2; readsB = n; paint(); return; }
+    if (step >= n - 1) reset(); if (timer) { clearInterval(timer); timer = 0; document.getElementById("s-play").textContent = "Play"; return; }
+    document.getElementById("s-play").textContent = "Pause"; timer = setInterval(advance, 220);
+  };
+  document.getElementById("s-reset").onclick = reset;
+  document.getElementById("s-n").oninput = e => { n = +e.target.value; reset(); };
+  reset();
+})();
+
+// event strips above the counter and map demos
+function strip(el, evs, on) {
+  const NS = "http://www.w3.org/2000/svg", w = 860, h = 64, bw = w / evs.length - 16;
+  el.replaceChildren(); el.setAttribute("viewBox", "0 0 " + w + " " + h);
+  evs.forEach((e, i) => { const g = document.createElementNS(NS, "g"); g.setAttribute("class", "ev" + (i < on ? "" : " off")); const r = document.createElementNS(NS, "rect"); r.setAttribute("x", 8 + i * (bw + 16)); r.setAttribute("y", 6); r.setAttribute("width", bw); r.setAttribute("height", 52); g.append(r);
+    const t = document.createElementNS(NS, "text"); t.setAttribute("x", 8 + i * (bw + 16) + bw / 2); t.setAttribute("y", 28); t.setAttribute("text-anchor", "middle"); t.setAttribute("font-weight", "700"); t.textContent = e[0]; const u = document.createElementNS(NS, "text"); u.setAttribute("x", 8 + i * (bw + 16) + bw / 2); u.setAttribute("y", 46); u.setAttribute("text-anchor", "middle"); u.setAttribute("style", "fill:var(--muted)"); u.textContent = e[1]; g.append(t, u); el.append(g); });
+}
+// reaction model
+const st = { cy: false, ada: false, ben: false, undone: false };
+const names = { ada: "Ada", ben: "Ben", cy: "Cy" };
+let order = [];
+function chips(el, who) {
+  el.replaceChildren();
+  if (!who.length) { const s = document.createElement("span"); s.className = "muted small"; s.textContent = "no reactions"; el.append(s); return; }
+  who.forEach(w => { const c = document.createElement("span"); c.className = "chip"; c.textContent = "👍 " + names[w]; el.append(c); });
+}
+function render() {
+  const old = st.undone ? order.slice(0, order.indexOf("ada")) : order;
+  const ours = st.undone ? order.filter(w => w !== "ada") : order;
+  // upstream main: when Cy reacted first the map existed and Ada's entry goes; otherwise her undo does nothing
+  const main = st.undone ? (st.cy ? order.filter(w => w !== "ada") : order) : order;
+  chips(document.getElementById("c-today"), old);
+  chips(document.getElementById("c-fixed"), ours);
+  chips(document.getElementById("c-main"), main);
+  document.getElementById("b-cy").disabled = st.ada;
+  document.getElementById("b-ada").disabled = st.ada;
+  document.getElementById("b-ben").disabled = !st.ada || st.ben;
+  document.getElementById("b-undo").disabled = !st.ada || st.undone;
+}
+function reset() { st.cy = st.ada = st.ben = st.undone = false; order = []; const b = document.getElementById("b-cy"); b.setAttribute("aria-pressed", "false"); b.classList.remove("on"); render(); }
+document.getElementById("b-cy").onclick = () => { if (st.ada) return; st.cy = !st.cy; order = st.cy ? ["cy"] : []; const b = document.getElementById("b-cy"); b.setAttribute("aria-pressed", String(st.cy)); b.classList.toggle("on", st.cy); render(); };
+document.getElementById("b-ada").onclick = () => { st.ada = true; order.push("ada"); render(); };
+document.getElementById("b-ben").onclick = () => { st.ben = true; order.push("ben"); render(); };
+document.getElementById("b-undo").onclick = () => { st.undone = true; render(); };
+document.getElementById("b-reset").onclick = reset;
+reset();
+
+// benchmark bars
+(function () {
+  const b = ORIG.benchmark, el = document.getElementById("bench");
+  [["Old store undo", b.today_break, "first"], ["My undo", b.with_change_break, "final"], ["Upstream main", MAIN.benchmark.p1_violations, "yellow"]].forEach(([label, n, cls]) => {
+    const row = document.createElement("div"); row.className = "barrow";
+    const l = document.createElement("span"); l.textContent = label;
+    const t = document.createElement("div"); t.className = "track";
+    const f = document.createElement("div"); f.className = "fill " + cls; f.style.width = (100 * n / b.independent) + "%";
+    const v = document.createElement("span"); v.className = "val"; v.textContent = n + " of " + b.independent.toLocaleString("en-US");
+    t.append(f); row.append(l, t, v); el.append(row);
+  });
+})();
+
+// latency explorers on a log scale
+const SHAPES = { one_change: "one big change", many_changes: "many small changes" };
+const fmt = us => us >= 1e6 ? (us / 1e6).toFixed(us >= 1e7 ? 1 : 2) + " s" : us >= 1e3 ? (us / 1e3).toFixed(us >= 1e5 ? 0 : 1) + " ms" : us + " µs";
+function explorer(cfg) {
+  let items = 10000, shape = "many_changes";
+  const pick = (id, opts, get, set) => {
+    const el = document.getElementById(id); el.replaceChildren();
+    opts.forEach(([val, label]) => { const b = document.createElement("button"); b.textContent = label; b.setAttribute("aria-pressed", String(get() === val)); b.onclick = () => { set(val); draw(); }; el.append(b); });
+  };
+  function draw() {
+    pick(cfg.itemsId, [100, 1000, 10000].map(n => [n, n.toLocaleString("en-US") + " items"]), () => items, v => items = v);
+    pick(cfg.shapeId, Object.entries(SHAPES), () => shape, v => shape = v);
+    const r = cfg.rows.find(x => x.items === items && x.shape === shape);
+    const el = document.getElementById(cfg.barsId); el.replaceChildren();
+    const lo = Math.log10(200), hi = Math.log10(5e7);
+    cfg.series.forEach(([label, key, cls]) => {
+      const us = r[key], base = r[cfg.baseKey];
+      const row = document.createElement("div"); row.className = "barrow";
+      const l = document.createElement("span"); l.textContent = label;
+      const t = document.createElement("div"); t.className = "track";
+      const f = document.createElement("div"); f.className = "fill " + cls; f.style.width = Math.max(1, 100 * (Math.log10(us) - lo) / (hi - lo)) + "%";
+      const v = document.createElement("span"); v.className = "val";
+      const cmp = key === cfg.baseKey ? "" : " · " + (us >= base ? (us / base).toFixed(us / base >= 10 ? 0 : 1) + "× slower" : (base / us).toFixed(1) + "× faster") + " than " + cfg.baseName;
+      v.textContent = fmt(us) + cmp;
+      t.append(f); row.append(l, t, v); el.append(row);
+    });
+  }
+  draw();
+}
+explorer({ itemsId: "n-items", shapeId: "n-shape", barsId: "nlat", rows: CUR.latency_median_us, baseKey: "old_store_us", baseName: "the old store undo",
+  series: [["Before upstream's change", "old_store_us", "today"], ["Upstream main", "main_us", "first"], ["Main with the repair", "fixed_us", "final"]] });
+explorer({ itemsId: "p-items", shapeId: "p-shape", barsId: "lat", rows: ORIG.latency_median_us, baseKey: "today_us", baseName: "the store's undo then",
+  series: [["Store's undo then", "today_us", "today"], ["My first version", "first_hook_us", "first"], ["My final version", "final_hook_us", "final"]] });
+
+// correctness demos: results recorded by running the ported tests on upstream main and with the repair
+(function () {
+  const S = { ada: false, ben: false, undone: false };
+  const chip = (el, text) => { el.replaceChildren(); const c = document.createElement("span"); c.className = "chip"; c.textContent = text; el.append(c); };
+  const kcount = () => S.undone ? [3, -2] : [S.ben ? 3 : S.ada ? 5 : 0, S.ben ? 3 : S.ada ? 5 : 0];
+  function drawK() {
+    strip(document.getElementById("k-strip"), [["start", "count 0"], ["Ada +5", "count 5"], ["Ben −2", "count 3"], ["Ada undoes", S.undone ? "upstream 3 · fix −2" : "…"]], 1 + (S.ada ? 1 : 0) + (S.ben ? 1 : 0) + (S.undone ? 1 : 0));
+    const [m, f] = kcount();
+    chip(document.getElementById("k-main"), "count = " + m);
+    chip(document.getElementById("k-fix"), "count = " + f);
+    document.getElementById("k-ada").disabled = S.ada;
+    document.getElementById("k-ben").disabled = !S.ada || S.ben;
+    document.getElementById("k-undo").disabled = !S.ben || S.undone;
+    document.getElementById("k-note").textContent = S.undone ? "Expected −2: Ada's 5 is gone and Ben's −2 stays. Upstream reports the slot as kept and writes nothing, so the count stays 3." : S.ben ? "Counter is 3 (5 and −2)." : S.ada ? "Counter is 5." : "The counter starts at 0.";
+  }
+  document.getElementById("k-ada").onclick = () => { S.ada = true; drawK(); };
+  document.getElementById("k-ben").onclick = () => { S.ben = true; drawK(); };
+  document.getElementById("k-undo").onclick = () => { S.undone = true; drawK(); };
+  document.getElementById("k-reset").onclick = () => { S.ada = S.ben = S.undone = false; drawK(); };
+  drawK();
+  const M = { run: false, ben: false, undone: false };
+  function drawM() {
+    strip(document.getElementById("m-strip"), [["m = {k}", "older map"], ["run replaces m", "m = {a}"], ["Ben writes b", "m = {a, b}"], ["undo the run", M.undone ? "upstream adds k" : "…"]], 1 + (M.run ? 1 : 0) + (M.ben ? 1 : 0) + (M.undone ? 1 : 0));
+    const before = !M.run ? 'm = {k: "old"}' : M.ben ? 'm = {a: "one", b: "second"}' : 'm = {a: "one"}';
+    chip(document.getElementById("m-main"), M.undone ? 'm = {a, b, k: "old"}  ← stale key k' : before);
+    chip(document.getElementById("m-fix"), M.undone ? "m = {a, b}" : before);
+    document.getElementById("m-run").disabled = M.run;
+    document.getElementById("m-ben").disabled = !M.run || M.ben;
+    document.getElementById("m-undo").disabled = !M.ben || M.undone;
+    document.getElementById("m-note").textContent = M.undone ? "The new map stays because Ben wrote in it. Upstream also writes the older map's key k into it. Expected {a, b}." : "m holds k from an older version. A run replaces m with a new map.";
+  }
+  document.getElementById("m-run").onclick = () => { M.run = true; drawM(); };
+  document.getElementById("m-ben").onclick = () => { M.ben = true; drawM(); };
+  document.getElementById("m-undo").onclick = () => { M.undone = true; drawM(); };
+  document.getElementById("m-reset").onclick = () => { M.run = M.ben = M.undone = false; drawM(); };
+  drawM();
+})();
+
+// Links to fill in after submission: set a URL here, the status text becomes a link. Empty means not filed yet.
+const LINKS = { perfPr: "https://code.tilo.so/tilo/tilo/pulls/5994", corrIssue: "https://code.tilo.so/tilo/tilo/issues/5995", corrPr: "https://code.tilo.so/tilo/tilo/pulls/5996" };
+const LINK_TEXT = { perfPr: "Pull request #5994 is open.", corrIssue: "Issue #5995 is open.", corrPr: "Pull request #5996 is open." };
+document.querySelectorAll("[data-link]").forEach(el => {
+  const url = LINKS[el.dataset.link];
+  if (!url) return;
+  const a = document.createElement("a"); a.href = url; a.textContent = LINK_TEXT[el.dataset.link];
+  el.replaceChildren(a);
+});
+
+// Links to fill in after submission: set a URL here, the status text becomes a link. Empty means not filed yet.
+</script>
+</body>
+</html>

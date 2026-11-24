@@ -1,0 +1,2765 @@
+diff --git a/crates/collab/resource-store/Cargo.toml b/crates/collab/resource-store/Cargo.toml
+index 0ba46e96ad..42b44dd8d1 100644
+--- a/crates/collab/resource-store/Cargo.toml
++++ b/crates/collab/resource-store/Cargo.toml
+@@ -36,6 +36,10 @@ path = "tests/it.rs"
+ name = "selective_undo"
+ path = "tests/selective_undo.rs"
+ 
++[[test]]
++name = "content_undo"
++path = "tests/content_undo.rs"
++
+ [[bench]]
+ name = "write_rate"
+ path = "benches/write_rate.rs"
+diff --git a/crates/collab/resource-store/src/lib.rs b/crates/collab/resource-store/src/lib.rs
+index 7155dfbe83..8b7a2d53a0 100644
+--- a/crates/collab/resource-store/src/lib.rs
++++ b/crates/collab/resource-store/src/lib.rs
+@@ -41,4 +41,5 @@ pub use index::{Change, Commit, CommitHook, Index, Indexed, PARENT};
+ pub use query::{Absent, Cursor, Filter, Order, Page, Query, Sort};
+ pub use schema::{Expected, FIELD_EDIT, Field, FieldKind, Schema, Type, Verb, Writes};
+ pub use store::{CHANGED, CREATED, Resource, Source, Store, StoreError, UPDATED, Written};
++pub use undo::ContentUndo;
+ pub use value::{Cell, Value};
+diff --git a/crates/collab/resource-store/src/store.rs b/crates/collab/resource-store/src/store.rs
+index ba5bf30b68..889177e8da 100644
+--- a/crates/collab/resource-store/src/store.rs
++++ b/crates/collab/resource-store/src/store.rs
+@@ -42,14 +42,15 @@ use std::sync::Arc;
+ 
+ use automerge::transaction::{CommitOptions, Transactable as _};
+ use automerge::{
+-    Automerge, Change as AmChange, ChangeHash, ObjId, ObjType, PatchLog, Prop, ROOT, ReadDoc,
+-    ScalarValue, Value as AmValue,
++    AutoCommit, Automerge, Change as AmChange, ChangeHash, ObjId, ObjType, PatchLog, Prop, ROOT,
++    ReadDoc, ScalarValue, Value as AmValue,
+ };
+ 
+ use crate::admit::{Admit, Proposal, Received, Refusal, Stamp};
+ use crate::index::{Change, Commit, CommitHook as _, Index, Indexed};
+ use crate::query::{Filter, Page, Query};
+ use crate::schema::Schema;
++use crate::undo::ContentUndo;
+ use crate::value::{Cell, Value};
+ 
+ /// The most resources one document holds before the next one starts.
+@@ -98,6 +99,8 @@ pub enum StoreError {
+     Document(automerge::AutomergeError),
+     /// A read was given where a write was asked for.
+     NotAWrite,
++    /// The injected content undo could not write the inverse.
++    Undo(String),
+ }
+ 
+ impl std::fmt::Display for StoreError {
+@@ -106,6 +109,7 @@ impl std::fmt::Display for StoreError {
+             Self::Missing { kind, id } => write!(f, "there is no {kind} `{id}`"),
+             Self::Document(error) => write!(f, "the document refused the change: {error}"),
+             Self::NotAWrite => write!(f, "that is a read, not a write"),
++            Self::Undo(reason) => write!(f, "the undo could not be written: {reason}"),
+         }
+     }
+ }
+@@ -198,6 +202,9 @@ pub struct Store {
+     /// from it: a change of it too, which its [`UPDATED`] reflects without reading the
+     /// history of what it holds.
+     nested_at: HashMap<String, String>,
++    /// Writes the inverse of an invocation's changes of a content, when set (see
++    /// [`Self::set_content_undo`]).
++    content_undo: Option<Box<dyn ContentUndo>>,
+ }
+ 
+ impl Store {
+@@ -237,11 +244,15 @@ impl Store {
+             filled,
+             index,
+             source: self.source.take(),
++            content_undo: self.content_undo.take(),
+             ..Self::default()
+         };
+-        let result = command(&mut staged);
++        // The source and the hook go back even if the command panics, or the live store would lose them.
++        let result =
++            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| command(&mut staged)));
+         self.source = staged.source.take();
+-        result
++        self.content_undo = staged.content_undo.take();
++        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+     }
+ 
+     /// Check a staged write against the live document and the same schema a received write uses.
+@@ -266,6 +277,12 @@ impl Store {
+         )
+     }
+ 
++    /// Makes [`Self::undo`] take back an invocation's edits of a content with `undo`, instead
++    /// of restoring each changed part of it whole.
++    pub fn set_content_undo(&mut self, undo: Box<dyn ContentUndo>) {
++        self.content_undo = Some(undo);
++    }
++
+     /// The index of everything the store holds, whoever may read it.
+     #[must_use]
+     pub const fn index(&self) -> &Index {
+@@ -841,16 +858,38 @@ impl Store {
+     /// is put back, a field or place it changed holds what it held before, and a part of a
+     /// content it changed holds what it held before. Written as `stamp`: an invocation of its
+     /// own, which names the verb it takes back and the invocation in `undoes`, so a holder
+-    /// admits it as that verb and undoing it takes this back.
++    /// admits it as that verb and undoing it takes this back. All or nothing across this
++    /// store's documents, index and watches: an error returns nothing, so nothing reached peers.
++    /// If taking back itself fails, the error says so and the store may hold a partial undo.
+     ///
+     /// # Errors
+     /// When a document cannot be read, or refuses the change.
+     pub fn undo(&mut self, invocation: &str, stamp: &Stamp) -> Result<Vec<Written>, StoreError> {
++        let before = self.heads_of_documents()?;
++        let mut written = Vec::new();
++        match self.undo_into(invocation, stamp, &mut written) {
++            Ok(()) => Ok(written),
++            // Nothing in `written` was returned, so none of it was sent: what `take_back` is for.
++            Err(error) => match self.take_back_all(&written, &before) {
++                Ok(()) => Err(error),
++                Err(rollback) => Err(StoreError::Undo(format!(
++                    "{error}; taking back the documents already undone also failed: {rollback}"
++                ))),
++            },
++        }
++    }
++
++    /// Undoes `invocation` document by document, adding each change to `written` as it is made.
++    fn undo_into(
++        &mut self,
++        invocation: &str,
++        stamp: &Stamp,
++        written: &mut Vec<Written>,
++    ) -> Result<(), StoreError> {
+         // The resources first, then their contents: a resource the undo puts back holds its
+         // content again, and the content of one it removes goes with it.
+         let mut docs: Vec<String> = self.index.documents().map(str::to_owned).collect();
+         docs.sort_by_key(|doc| crate::admit::content_resource(doc).is_some());
+-        let mut written = Vec::new();
+         for doc_id in docs {
+             let readers = self.index.readers(&doc_id).unwrap_or_default().to_owned();
+             let Some(doc) = self.existing(&doc_id)? else {
+@@ -879,12 +918,17 @@ impl Store {
+                 if changed.is_empty() {
+                     continue;
+                 }
+-                let ((), change) = self.edit_content(&kind, &id, stamp, |tx, root| {
+-                    for key in changed {
+-                        crate::undo::undo_key(&span, (&was, &became), &key, tx, root)?;
+-                    }
+-                    Ok(())
+-                })?;
++                let change = if self.content_undo.is_some() {
++                    self.undo_content_with_hook(&kind, &id, (&span, &became, &changed), stamp)?
++                } else {
++                    let ((), change) = self.edit_content(&kind, &id, stamp, |tx, root| {
++                        for key in changed {
++                            crate::undo::undo_key(&span, (&was, &became), &key, tx, root)?;
++                        }
++                        Ok(())
++                    })?;
++                    change
++                };
+                 written.extend(change);
+                 continue;
+             }
+@@ -938,7 +982,88 @@ impl Store {
+                 }
+             }
+         }
+-        Ok(written)
++        Ok(())
++    }
++
++    /// The heads of every document the store knows, each read into memory (`undo_into` reads every one too, so a
++    /// document that cannot be read fails the undo either way).
++    fn heads_of_documents(&mut self) -> Result<HashMap<String, Vec<ChangeHash>>, StoreError> {
++        let ids: Vec<String> = self.index.documents().map(str::to_owned).collect();
++        let mut heads = HashMap::new();
++        for id in ids {
++            if let Some(doc) = self.existing(&id)? {
++                heads.insert(id, doc.get_heads());
++            }
++        }
++        Ok(heads)
++    }
++
++    /// Takes back every document `written` changed to the heads it had in `before`; tries them all and answers
++    /// the first failure.
++    fn take_back_all(
++        &mut self,
++        written: &[Written],
++        before: &HashMap<String, Vec<ChangeHash>>,
++    ) -> Result<(), StoreError> {
++        let docs: BTreeSet<&str> = written.iter().map(|written| written.doc.as_str()).collect();
++        let mut first = Ok(());
++        for doc in docs {
++            let heads = before.get(doc).map(Vec::as_slice).unwrap_or_default();
++            let result = self.take_back(doc, heads);
++            if first.is_ok() {
++                first = result;
++            }
++        }
++        first
++    }
++
++    /// Takes back `span`'s edits of the content of the resource `id` of `kind` with the hook:
++    /// answers the change, `None` when the hook changed nothing.
++    fn undo_content_with_hook(
++        &mut self,
++        kind: &str,
++        id: &str,
++        (span, became, keys): (&crate::undo::Span, &Automerge, &[String]),
++        stamp: &Stamp,
++    ) -> Result<Option<Written>, StoreError> {
++        let fail = || StoreError::Document(automerge::AutomergeError::Fail);
++        let (doc_id, readers) = self.content_of(kind, id)?;
++        let (before, saved) = {
++            let doc = self.existing(&doc_id)?.ok_or_else(fail)?;
++            (doc.get_heads(), doc.save())
++        };
++        let hook = self.content_undo.as_deref().ok_or_else(fail)?;
++        // A fork under an actor of its own: the stored document is untouched unless the hook
++        // succeeds, and the change then applies to it as a peer's would.
++        let mut fork = AutoCommit::load(&saved)?.with_actor(automerge::ActorId::random());
++        hook.undo(&mut fork, &span.changes())
++            .map_err(StoreError::Undo)?;
++        crate::undo::take_back_entries(span, became, &mut fork, keys)?;
++        fork.commit_with(CommitOptions::default().with_message(stamp.message()));
++        if fork.get_heads() == before {
++            return Ok(None);
++        }
++        // `Written` carries one change for replication; a hook that wrote several is refused, not truncated.
++        let mut changes = fork.get_changes(&before);
++        let (Some(change), None) = (changes.pop(), changes.pop()) else {
++            return Err(StoreError::Undo(
++                "the undo wrote more than one change".into(),
++            ));
++        };
++        let doc = self.existing(&doc_id)?.ok_or_else(fail)?;
++        doc.apply_changes(vec![change.clone()])?;
++        let heads = doc.get_heads();
++        self.index.committed(&Commit {
++            doc: &doc_id,
++            readers: &readers,
++            heads: &heads,
++            changes: &[],
++        });
++        Ok(Some(Written {
++            doc: doc_id,
++            readers,
++            change,
++        }))
+     }
+ 
+     /// The document `doc` when it exists, in memory or at the source; `None` for one never
+@@ -2367,3 +2492,54 @@ fn put_fields(
+     let (hash, _) = tx.commit_with(CommitOptions::default().with_message(stamp.message()));
+     Ok(hash.and_then(|_| doc.get_last_local_change()))
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn resource(readers: &str, n: Option<i64>) -> Resource {
++        Resource {
++            readers: readers.to_owned(),
++            fields: n
++                .map(|n| ("n".to_owned(), Cell::One(Value::Int(n))))
++                .into_iter()
++                .collect(),
++            ..Resource::default()
++        }
++    }
++
++    #[test]
++    fn take_back_all_tries_every_document_and_answers_the_first_failure() {
++        let ids = [("a", "*"), ("b", "team")];
++        // Whichever document fails, the other is still taken back.
++        for failing in 0..2 {
++            let mut store = Store::new();
++            let stamp = Stamp::default();
++            for (id, readers) in ids {
++                store
++                    .put("note", id, resource(readers, None), &stamp)
++                    .unwrap();
++            }
++            let mut before = store.heads_of_documents().unwrap();
++            let mut written = Vec::new();
++            for (id, readers) in ids {
++                written.extend(
++                    store
++                        .put("note", id, resource(readers, Some(1)), &stamp)
++                        .unwrap(),
++                );
++            }
++            assert_eq!(written.len(), 2);
++            before.insert(written[failing].doc.clone(), vec![ChangeHash([7; 32])]);
++            let good = &written[1 - failing].doc;
++
++            assert!(store.take_back_all(&written, &before).is_err());
++
++            assert_eq!(store.document(good).unwrap().get_heads(), before[good]);
++            let taken_back = store.index().get("note", ids[1 - failing].0).unwrap();
++            assert!(taken_back.fields.is_empty());
++            let kept = store.index().get("note", ids[failing].0).unwrap();
++            assert!(!kept.fields.is_empty());
++        }
++    }
++}
+diff --git a/crates/collab/resource-store/src/undo.rs b/crates/collab/resource-store/src/undo.rs
+index 62e1a6ce63..b995c4afff 100644
+--- a/crates/collab/resource-store/src/undo.rs
++++ b/crates/collab/resource-store/src/undo.rs
+@@ -6,11 +6,22 @@ use std::collections::BTreeSet;
+ 
+ use automerge::transaction::{Transactable as _, Transaction};
+ use automerge::{
+-    ActorId, Automerge, ChangeHash, ObjId, ObjType, ROOT, ReadDoc, ScalarValue, Value,
++    ActorId, AutoCommit, Automerge, ChangeHash, ObjId, ObjType, ROOT, ReadDoc, ScalarValue, Value,
+ };
+ 
+ use crate::admit::Stamp;
+ 
++/// Writes the inverse of an invocation's changes into a content document: the store's hook for
++/// an undo that keeps every later independent edit.
++pub trait ContentUndo: Send {
++    /// Writes the inverse of `changes` (newest first, each with its actor's hex) into `doc`, and
++    /// leaves the transaction open for the store to commit.
++    ///
++    /// # Errors
++    /// When the inverse cannot be written.
++    fn undo(&self, doc: &mut AutoCommit, changes: &[(ChangeHash, String)]) -> Result<(), String>;
++}
++
+ /// The stretch of a document's history one invocation wrote.
+ pub(crate) struct Span {
+     /// The heads before its first change.
+@@ -19,6 +30,8 @@ pub(crate) struct Span {
+     pub after: Vec<ChangeHash>,
+     /// Each of its changes' operations: the actor, and the first and last counter.
+     ops: Vec<(ActorId, u64, u64)>,
++    /// Each of its changes, oldest first: the hash and the actor's hex.
++    changes: Vec<(ChangeHash, String)>,
+ }
+ 
+ impl Span {
+@@ -27,6 +40,7 @@ impl Span {
+         let mut before = None;
+         let mut last = None;
+         let mut ops = Vec::new();
++        let mut changes = Vec::new();
+         for change in doc.get_changes_meta(&[]) {
+             let stamp = change
+                 .message
+@@ -35,6 +49,7 @@ impl Span {
+             if stamp.is_some_and(|stamp| stamp.invocation == invocation) {
+                 before.get_or_insert(change.deps);
+                 last = Some(change.hash);
++                changes.push((change.hash, change.actor.to_hex_string()));
+                 ops.push((change.actor.into_owned(), change.start_op, change.max_op));
+             }
+         }
+@@ -42,9 +57,15 @@ impl Span {
+             before: before?,
+             after: vec![last?],
+             ops,
++            changes,
+         })
+     }
+ 
++    /// The invocation's changes, newest first, each with its actor's hex.
++    pub(crate) fn changes(&self) -> Vec<(ChangeHash, String)> {
++        self.changes.iter().rev().cloned().collect()
++    }
++
+     /// Whether the operation `id` is one of the invocation's.
+     fn made(&self, id: &ObjId) -> bool {
+         let ObjId::Id(counter, actor, _) = id else {
+@@ -56,6 +77,49 @@ impl Span {
+     }
+ }
+ 
++/// After the hook has kept a map the invocation made (somebody wrote into it since), takes back
++/// the plain entries the invocation put there and nobody has set again. Only a flat map counts: one
++/// whose entries are all plain values is a keyed collection, so its entries stand alone. A map
++/// holding an object (a block with its text) is a structure others built on, and stays whole.
++pub(crate) fn take_back_entries(
++    span: &Span,
++    became: &Automerge,
++    fork: &mut AutoCommit,
++    keys: &[String],
++) -> Result<(), automerge::AutomergeError> {
++    for key in keys {
++        let Some((Value::Object(ObjType::Map), map)) = became.get(ROOT, key)? else {
++            continue;
++        };
++        let Some((Value::Object(ObjType::Map), now)) = fork.get(ROOT, key)? else {
++            continue;
++        };
++        if now != map || !span.made(&map) || !is_flat(fork, &map) {
++            continue;
++        }
++        let mut own = Vec::new();
++        for item in became.map_range(&map, ..) {
++            // Only the invocation's own write stands at the entry: nobody set it again, and no
++            // concurrent write is held beside it.
++            let alone = fork.get_all(&map, item.key.as_ref())?;
++            let still_theirs = matches!(alone.as_slice(), [(_, id)] if *id == item.id());
++            if still_theirs {
++                own.push(item.key.to_string());
++            }
++        }
++        for name in own {
++            fork.delete(&map, name.as_str())?;
++        }
++    }
++    Ok(())
++}
++
++/// Whether every entry of the map `map` is a plain value.
++fn is_flat(doc: &AutoCommit, map: &ObjId) -> bool {
++    doc.map_range(map, ..)
++        .all(|item| matches!(Value::from(item.value), Value::Scalar(_)))
++}
++
+ /// Takes back what the invocation `span` did to the key `key` at the root of a content: `was`
+ /// is the content before it, `became` after it, and `root` the content now.
+ pub(crate) fn undo_key(
+@@ -153,3 +217,77 @@ fn undo_text(
+     }
+     Ok(())
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::sync::{Arc, Mutex};
++
++    use automerge::transaction::Transactable as _;
++
++    use super::*;
++    use crate::store::{Resource, Store};
++
++    type Seen = Arc<Mutex<Vec<(ChangeHash, String)>>>;
++
++    struct Recorder(Seen);
++
++    impl ContentUndo for Recorder {
++        fn undo(
++            &self,
++            doc: &mut AutoCommit,
++            changes: &[(ChangeHash, String)],
++        ) -> Result<(), String> {
++            self.0
++                .lock()
++                .map_err(|error| error.to_string())?
++                .extend_from_slice(changes);
++            doc.put(ROOT, "meta", "undone")
++                .map_err(|error| error.to_string())
++        }
++    }
++
++    fn stamp(invocation: &str) -> Stamp {
++        Stamp {
++            invocation: invocation.to_owned(),
++            ..Stamp::default()
++        }
++    }
++
++    fn edit(store: &mut Store, invocation: &str, value: &str) -> automerge::Change {
++        let ((), written) = store
++            .edit_content("note", "n1", &stamp(invocation), |tx, root| {
++                tx.put(root, "meta", value)
++            })
++            .unwrap();
++        written.unwrap().change
++    }
++
++    #[test]
++    fn the_hook_gets_the_invocations_changes_newest_first() {
++        let seen = Seen::default();
++        let mut store = Store::new();
++        store.set_content_undo(Box::new(Recorder(seen.clone())));
++        let resource = Resource {
++            readers: "*".to_owned(),
++            ..Resource::default()
++        };
++        store.put("note", "n1", resource, &stamp("setup")).unwrap();
++        let first = edit(&mut store, "a", "1");
++        edit(&mut store, "b", "2");
++        let last = edit(&mut store, "a", "3");
++        let undo_stamp = stamp("undo-a");
++
++        let written = store.undo("a", &undo_stamp).unwrap();
++
++        let expected: Vec<_> = [&last, &first]
++            .iter()
++            .map(|change| (change.hash(), change.actor_id().to_hex_string()))
++            .collect();
++        assert_eq!(*seen.lock().unwrap(), expected);
++        assert_eq!(written.len(), 1);
++        assert_eq!(
++            written[0].change.message().map(str::to_owned),
++            Some(undo_stamp.message())
++        );
++    }
++}
+diff --git a/crates/collab/resource-store/tests/content_undo.rs b/crates/collab/resource-store/tests/content_undo.rs
+new file mode 100644
+index 0000000000..3fb09d72a8
+--- /dev/null
++++ b/crates/collab/resource-store/tests/content_undo.rs
+@@ -0,0 +1,365 @@
++#![allow(
++    clippy::unwrap_used,
++    clippy::expect_used,
++    clippy::indexing_slicing,
++    reason = "test assertions"
++)]
++
++//! The store's content-undo hook: what `Store::undo` answers when the injected hook fails, writes
++//! nothing, writes more than one change, or writes one inverse change.
++
++use std::collections::BTreeMap;
++use std::sync::{Arc, Mutex};
++
++use automerge::transaction::Transactable as _;
++use automerge::{AutoCommit, ChangeHash, ROOT, ReadDoc as _};
++use serde_json::json;
++use tilo_resource_store::store::StoreError;
++use tilo_resource_store::{ContentUndo, Resource, Stamp, Store};
++
++/// A hook that runs `body` on the document and ignores which changes it is asked to undo.
++struct Hook(fn(&mut AutoCommit) -> Result<(), String>);
++
++impl ContentUndo for Hook {
++    fn undo(&self, doc: &mut AutoCommit, _: &[(ChangeHash, String)]) -> Result<(), String> {
++        (self.0)(doc)
++    }
++}
++
++fn stamp(invocation: &str) -> Stamp {
++    Stamp {
++        invocation: invocation.to_owned(),
++        ..Stamp::default()
++    }
++}
++
++/// A store with the note `n1` whose content was edited by the invocation `a`, undone by `hook`;
++/// answers the store and the content document's id.
++fn edited(hook: Hook) -> (Store, String) {
++    edited_in(Store::new(), hook)
++}
++
++/// As [`edited`], in `store`.
++fn edited_in(mut store: Store, hook: Hook) -> (Store, String) {
++    store.set_content_undo(Box::new(hook));
++    let resource = Resource {
++        readers: "*".to_owned(),
++        ..Resource::default()
++    };
++    store.put("note", "n1", resource, &stamp("setup")).unwrap();
++    let ((), written) = store
++        .edit_content("note", "n1", &stamp("a"), |tx, root| {
++            tx.put(root, "meta", "1")
++        })
++        .unwrap();
++    (store, written.unwrap().doc)
++}
++
++fn content(store: &Store) -> Option<serde_json::Value> {
++    store.content_json("note", "n1")
++}
++
++fn heads(store: &Store, doc: &str) -> Vec<ChangeHash> {
++    store.document(doc).unwrap().get_heads()
++}
++
++#[test]
++fn a_hook_that_fails_makes_the_undo_fail_and_leaves_the_content() {
++    let (mut store, doc) = edited(Hook(|_| Err("nope".to_owned())));
++    let before = (content(&store), heads(&store, &doc));
++
++    let error = store.undo("a", &stamp("undo-a")).unwrap_err();
++
++    assert!(matches!(&error, StoreError::Undo(reason) if reason.contains("nope")));
++    assert_eq!((content(&store), heads(&store, &doc)), before);
++}
++
++#[test]
++fn a_hook_that_writes_nothing_gives_no_write() {
++    let (mut store, doc) = edited(Hook(|_| Ok(())));
++    let before = (content(&store), heads(&store, &doc));
++
++    let written = store.undo("a", &stamp("undo-a")).unwrap();
++
++    assert!(written.is_empty());
++    assert_eq!((content(&store), heads(&store, &doc)), before);
++}
++
++#[test]
++fn a_hook_that_commits_twice_is_refused_and_leaves_the_content() {
++    let (mut store, doc) = edited(Hook(|doc| {
++        doc.put(ROOT, "first", 1)
++            .map_err(|error| error.to_string())?;
++        doc.commit();
++        doc.put(ROOT, "second", 2)
++            .map_err(|error| error.to_string())
++    }));
++    let before = (content(&store), heads(&store, &doc));
++
++    let error = store.undo("a", &stamp("undo-a")).unwrap_err();
++
++    assert!(matches!(&error, StoreError::Undo(reason) if reason.contains("more than one change")));
++    assert_eq!((content(&store), heads(&store, &doc)), before);
++}
++
++#[test]
++fn a_hook_that_writes_one_change_shows_in_the_content_with_one_write() {
++    let (mut store, doc) = edited(Hook(|doc| {
++        doc.put(ROOT, "meta", "undone")
++            .map_err(|error| error.to_string())
++    }));
++    let before = heads(&store, &doc);
++
++    let written = store.undo("a", &stamp("undo-a")).unwrap();
++
++    assert_eq!(content(&store), Some(json!({"meta": "undone"})));
++    assert_eq!(written.len(), 1);
++    assert_eq!(written[0].doc, doc);
++    assert_ne!(heads(&store, &doc), before);
++}
++
++#[test]
++fn a_hook_that_fails_on_a_later_note_leaves_every_note() {
++    let mut store = Store::new();
++    store.set_content_undo(Box::new(Hook(|doc| {
++        if doc
++            .get(ROOT, "fail")
++            .map_err(|error| error.to_string())?
++            .is_some()
++        {
++            return Err("marked".to_owned());
++        }
++        doc.put(ROOT, "meta", "undone")
++            .map_err(|error| error.to_string())
++    })));
++    for id in ["n1", "n2"] {
++        let resource = Resource {
++            readers: "*".to_owned(),
++            ..Resource::default()
++        };
++        store.put("note", id, resource, &stamp("setup")).unwrap();
++        store
++            .edit_content("note", id, &stamp("a"), |tx, root| {
++                tx.put(root, "meta", "1")
++            })
++            .unwrap();
++    }
++    store
++        .edit_content("note", "n2", &stamp("b"), |tx, root| {
++            tx.put(root, "fail", true)
++        })
++        .unwrap();
++
++    let error = store.undo("a", &stamp("undo-a")).unwrap_err();
++
++    assert!(matches!(error, StoreError::Undo(_)));
++    assert_eq!(store.content_json("note", "n1"), Some(json!({"meta": "1"})));
++    assert_eq!(
++        store.content_json("note", "n2"),
++        Some(json!({"fail": true, "meta": "1"}))
++    );
++}
++
++/// A hook that fails on a content marked with a `fail` key and otherwise writes one change.
++fn fail_if_marked(doc: &mut AutoCommit) -> Result<(), String> {
++    if doc
++        .get(ROOT, "fail")
++        .map_err(|error| error.to_string())?
++        .is_some()
++    {
++        return Err("marked".to_owned());
++    }
++    doc.put(ROOT, "meta", "undone")
++        .map_err(|error| error.to_string())
++}
++
++fn everyone() -> Resource {
++    Resource {
++        readers: "*".to_owned(),
++        ..Resource::default()
++    }
++}
++
++/// The notes `n1` and `n2`, whose contents invocation `a` edited, and the resource `n3` it made;
++/// then `marked` is marked by `b`, so the hook fails on it.
++fn made_and_edited(marked: &str) -> Store {
++    let mut store = Store::new();
++    store.set_content_undo(Box::new(Hook(fail_if_marked)));
++    for id in ["n1", "n2"] {
++        store.put("note", id, everyone(), &stamp("setup")).unwrap();
++    }
++    store.put("note", "n3", everyone(), &stamp("a")).unwrap();
++    for id in ["n1", "n2"] {
++        store
++            .edit_content("note", id, &stamp("a"), |tx, root| {
++                tx.put(root, "meta", "1")
++            })
++            .unwrap();
++    }
++    store
++        .edit_content("note", marked, &stamp("b"), |tx, root| {
++            tx.put(root, "fail", true)
++        })
++        .unwrap();
++    store
++}
++
++#[derive(Debug, PartialEq)]
++struct Note {
++    resource: Option<(String, Option<String>, Option<String>)>,
++    readers: Option<String>,
++    content: Option<serde_json::Value>,
++}
++
++/// What a failed undo must leave alone.
++#[derive(Debug, PartialEq)]
++struct State {
++    heads: BTreeMap<String, Vec<ChangeHash>>,
++    notes: Vec<Note>,
++    removed: Vec<String>,
++}
++
++fn note(store: &Store, id: &str) -> Note {
++    let held = store.get("note", id, &|_| true);
++    Note {
++        resource: held.map(|held| (held.doc.clone(), held.parent.clone(), held.order.clone())),
++        readers: held
++            .and_then(|held| store.index().readers(&held.doc))
++            .map(str::to_owned),
++        content: store.content_json("note", id),
++    }
++}
++
++fn state(store: &Store) -> State {
++    State {
++        heads: store
++            .index()
++            .documents()
++            .filter_map(|doc| Some((doc.to_owned(), store.document(doc)?.get_heads())))
++            .collect(),
++        notes: ["n1", "n2", "n3"]
++            .iter()
++            .map(|id| note(store, id))
++            .collect(),
++        removed: store.removed("note", None, &|_| true),
++    }
++}
++
++fn assert_failed_undo_changes_nothing(marked: &str) {
++    let mut store = made_and_edited(marked);
++    let before = state(&store);
++    assert!(before.notes[2].resource.is_some());
++    let removed_before = store.removed("note", None, &|_| true);
++
++    let error = store.undo("a", &stamp("undo-a")).unwrap_err();
++
++    assert!(matches!(error, StoreError::Undo(reason) if reason.contains("marked")));
++    assert_eq!(state(&store), before);
++    // A resource the failed undo removed and the rollback put back is not listed as removed.
++    assert_eq!(store.removed("note", None, &|_| true), removed_before);
++}
++
++#[test]
++fn a_failed_undo_restores_a_resource_it_removed_and_every_note_when_n2_fails() {
++    assert_failed_undo_changes_nothing("n2");
++}
++
++#[test]
++fn a_failed_undo_restores_a_resource_it_removed_and_every_note_when_n1_fails() {
++    assert_failed_undo_changes_nothing("n1");
++}
++
++#[test]
++fn a_watch_and_count_made_before_a_failed_undo_answer_the_same_after() {
++    let mut store = made_and_edited("n2");
++    let watch = store.watch("note");
++    let before = store.count("note", &[], &|_| true);
++    assert_eq!(before, 3);
++
++    store.undo("a", &stamp("undo-a")).unwrap_err();
++
++    assert_eq!(store.count("note", &[], &|_| true), before);
++    // A change notice is allowed, and only for this watch.
++    assert!(store.changed().iter().all(|changed| *changed == watch));
++}
++
++#[test]
++fn a_drafted_undo_uses_the_hook_and_leaves_the_store_and_its_hook() {
++    use tilo_resource_store::wire::{Command, draft};
++    let (mut store, doc) = edited(Hook(|doc| {
++        doc.put(ROOT, "meta", "undone")
++            .map_err(|error| error.to_string())
++    }));
++    let before = (content(&store), heads(&store, &doc));
++    let undo = || Command::Undo {
++        invocation: "a".to_owned(),
++        stamp: stamp("undo-a"),
++    };
++
++    let drafted = draft(&mut store, undo()).unwrap();
++
++    assert_eq!(drafted.len(), 1);
++    let mut staged = store.document(&doc).unwrap().clone();
++    staged.apply_changes([drafted[0].change.clone()]).unwrap();
++    let meta = staged.get(ROOT, "meta").unwrap().unwrap().0;
++    assert_eq!(meta.into_string().unwrap(), "undone");
++    assert_eq!((content(&store), heads(&store, &doc)), before);
++    store.undo("a", &stamp("undo-a")).unwrap();
++    assert_eq!(content(&store), Some(json!({"meta": "undone"})));
++}
++
++#[test]
++fn an_evicted_content_is_read_again_from_the_source_and_undone_with_the_hook() {
++    let saved: Arc<Mutex<Option<Vec<u8>>>> = Arc::default();
++    let source = Arc::clone(&saved);
++    let store = Store::with_source(Box::new(move |_| source.lock().unwrap().clone()));
++    let (mut store, doc) = edited_in(
++        store,
++        Hook(|doc| {
++            doc.put(ROOT, "meta", "undone")
++                .map_err(|error| error.to_string())
++        }),
++    );
++    *saved.lock().unwrap() = store.evict(&doc);
++    assert!(store.document(&doc).is_none());
++
++    let written = store.undo("a", &stamp("undo-a")).unwrap();
++
++    assert_eq!(written.len(), 1);
++    assert_eq!(content(&store), Some(json!({"meta": "undone"})));
++}
++
++/// Panics the first time it is asked, then writes `meta = "undone"`.
++struct PanicsOnce(std::sync::atomic::AtomicBool);
++
++impl ContentUndo for PanicsOnce {
++    #[allow(clippy::panic_in_result_fn, reason = "panicking is this double's job")]
++    fn undo(&self, doc: &mut AutoCommit, _: &[(ChangeHash, String)]) -> Result<(), String> {
++        assert!(
++            self.0.swap(true, std::sync::atomic::Ordering::SeqCst),
++            "first call panics"
++        );
++        doc.put(ROOT, "meta", "undone")
++            .map_err(|error| error.to_string())
++    }
++}
++
++#[test]
++fn a_draft_that_panics_leaves_the_hook_in_the_live_store() {
++    use tilo_resource_store::wire::{Command, draft};
++    let (mut store, _) = edited(Hook(|_| Ok(())));
++    store.set_content_undo(Box::new(PanicsOnce(std::sync::atomic::AtomicBool::new(
++        false,
++    ))));
++    let undo = Command::Undo {
++        invocation: "a".to_owned(),
++        stamp: stamp("undo-a"),
++    };
++
++    let panicked =
++        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| draft(&mut store, undo)));
++
++    assert!(panicked.is_err());
++    store.undo("a", &stamp("undo-a")).unwrap();
++    assert_eq!(content(&store), Some(json!({"meta": "undone"})));
++}
+diff --git a/crates/server/tilo-workspace-service/src/workspaces.rs b/crates/server/tilo-workspace-service/src/workspaces.rs
+index 6079eaa77d..fb53ca26cd 100644
+--- a/crates/server/tilo-workspace-service/src/workspaces.rs
++++ b/crates/server/tilo-workspace-service/src/workspaces.rs
+@@ -149,6 +149,8 @@ mod publication;
+ use publication::{Change, SinceBase, starts_over, withdraws};
+ #[cfg(test)]
+ use publication::{MAX_PUBLICATION_TAIL, MIN_PUBLICATION_TAIL_BYTES, based};
++#[cfg(any(feature = "agents", feature = "apps"))]
++pub mod content_undo;
+ mod document_format;
+ mod record_authority;
+ mod resources;
+diff --git a/crates/server/tilo-workspace-service/src/workspaces/content_undo.rs b/crates/server/tilo-workspace-service/src/workspaces/content_undo.rs
+new file mode 100644
+index 0000000000..672d92e74b
+--- /dev/null
++++ b/crates/server/tilo-workspace-service/src/workspaces/content_undo.rs
+@@ -0,0 +1,28 @@
++//! Tilo's selective revert as the resource store's content undo. It lives here, where both are
++//! linked: collaboration stays free of the store.
++
++use automerge::{AutoCommit, ChangeHash};
++use tilo_resource_store::ContentUndo;
++
++use collaboration::history_source::authors::{HistoryAuthor, ResolveAuthor};
++use collaboration::history_source::revert::revert_changes;
++
++/// Names every actor by its hex: the outcome's text is not used here.
++pub struct ActorNamed;
++
++impl ResolveAuthor for ActorNamed {
++    fn resolve(&self, actor: &str) -> HistoryAuthor {
++        HistoryAuthor::new(actor, 0.0, actor)
++    }
++}
++
++/// Undoes an invocation's changes with [`revert_changes`], keeping later independent edits.
++pub struct RevertContentUndo;
++
++impl ContentUndo for RevertContentUndo {
++    fn undo(&self, doc: &mut AutoCommit, changes: &[(ChangeHash, String)]) -> Result<(), String> {
++        revert_changes(doc, changes, &ActorNamed)
++            .map(|_| ())
++            .map_err(|error| format!("{error:?}"))
++    }
++}
+diff --git a/crates/server/tilo-workspace-service/src/workspaces/resources.rs b/crates/server/tilo-workspace-service/src/workspaces/resources.rs
+index c100327361..bc9accc4e4 100644
+--- a/crates/server/tilo-workspace-service/src/workspaces/resources.rs
++++ b/crates/server/tilo-workspace-service/src/workspaces/resources.rs
+@@ -103,6 +103,9 @@ impl Resources {
+         let mut store = Store::with_source(Box::new(move |doc| {
+             fs::read(reading.join(file_name(doc))).ok()
+         }));
++        // Undo keeps later independent edits: Tilo's revert machinery plans it.
++        #[cfg(any(feature = "agents", feature = "apps"))]
++        store.set_content_undo(Box::new(super::content_undo::RevertContentUndo));
+         let mut used = BTreeMap::new();
+         let mut unsnapshotted = BTreeSet::new();
+         // What the store kept of each document is read side by side, and each document is
+diff --git a/crates/server/tilo-workspace-service/tests/selective_undo_merge.rs b/crates/server/tilo-workspace-service/tests/selective_undo_merge.rs
+new file mode 100644
+index 0000000000..dd59df9264
+--- /dev/null
++++ b/crates/server/tilo-workspace-service/tests/selective_undo_merge.rs
+@@ -0,0 +1,244 @@
++#![cfg(any(feature = "agents", feature = "apps"))]
++#![allow(clippy::unwrap_used, clippy::expect_used, reason = "test assertions")]
++
++//! Selective undo with Tilo's revert installed, beyond one store: an undo of an invocation whose
++//! independent neighbour came from a peer, and an invocation that changed several documents.
++
++use std::collections::BTreeMap;
++
++use automerge::transaction::{Transactable as _, Transaction};
++use automerge::{
++    AutoCommit, AutomergeError, ChangeHash, ObjId, ObjType, ROOT, ReadDoc as _, ScalarValue, Value,
++};
++use serde_json::json;
++use tilo_resource_store::store::StoreError;
++use tilo_resource_store::{ContentUndo, Proposal, Received, Resource, Stamp, Store, Written};
++use tilo_workspace_service::workspaces::content_undo::RevertContentUndo;
++
++type Edit = fn(&mut Transaction<'_>, &ObjId) -> Result<(), AutomergeError>;
++
++fn stamp(invocation: &str) -> Stamp {
++    Stamp {
++        invocation: invocation.to_owned(),
++        ..Stamp::default()
++    }
++}
++
++fn resource() -> Resource {
++    Resource {
++        readers: "*".to_owned(),
++        ..Resource::default()
++    }
++}
++
++/// Edits the content of the note `id`; the edit must change it.
++fn write(store: &mut Store, id: &str, invocation: &str, edit: Edit) -> Written {
++    let ((), written) = store
++        .edit_content("note", id, &stamp(invocation), edit)
++        .unwrap();
++    written.unwrap()
++}
++
++/// Hands a peer's change to `store` the way the network does.
++fn deliver(store: &mut Store, written: &Written) {
++    let received = Received {
++        change: written.change.clone(),
++        author: [0; 32],
++    };
++    store
++        .receive(
++            &written.doc,
++            &written.readers,
++            vec![received],
++            &|_: &Proposal<'_>| true,
++        )
++        .unwrap();
++}
++
++/// The root of a content document, every value shown as text (a counter as its number).
++fn observe(store: &Store, doc: &str) -> BTreeMap<String, String> {
++    let doc = store.document(doc).unwrap();
++    doc.keys(ROOT)
++        .map(|key| {
++            let shown = match doc.get(ROOT, key.as_str()).unwrap() {
++                Some((Value::Object(ObjType::Text), id)) => doc.text(&id).unwrap(),
++                Some((Value::Scalar(scalar), _)) => match scalar.as_ref() {
++                    ScalarValue::Counter(counter) => i64::from(counter).to_string(),
++                    other => format!("{other:?}"),
++                },
++                other => format!("{other:?}"),
++            };
++            (key, shown)
++        })
++        .collect()
++}
++
++fn body(tx: &Transaction<'_>, root: &ObjId) -> Result<ObjId, AutomergeError> {
++    tx.get(root, "body")?
++        .map(|(_, id)| id)
++        .ok_or_else(|| AutomergeError::InvalidObjId("body".to_owned()))
++}
++
++/// Two stores share a base. `mine` (i2) is made in A, `theirs` (i3) in B without seeing i2, and A
++/// receives i3. A undoes i2; B then receives i2 and A's undo.
++struct Merged {
++    a: Store,
++    b: Store,
++    doc: String,
++    /// B's content before it saw i2: a replay of the history without i2.
++    without_i2: BTreeMap<String, String>,
++}
++
++fn merged(base: Edit, mine: Edit, theirs: Edit) -> Merged {
++    let mut a = Store::new();
++    a.set_content_undo(Box::new(RevertContentUndo));
++    let made = a.put("note", "n1", resource(), &stamp("i1")).unwrap();
++    let base = write(&mut a, "n1", "i1", base);
++    let mut b = Store::new();
++    for written in made.iter().chain([&base]) {
++        deliver(&mut b, written);
++    }
++    let own = write(&mut a, "n1", "i2", mine);
++    let other = write(&mut b, "n1", "i3", theirs);
++    let without_i2 = observe(&b, &base.doc);
++    deliver(&mut a, &other);
++    // B needs i2 to take A's undo, which depends on it.
++    deliver(&mut b, &own);
++    for undo in a.undo("i2", &stamp("undo-i2")).unwrap() {
++        deliver(&mut b, &undo);
++    }
++    Merged {
++        a,
++        b,
++        doc: base.doc,
++        without_i2,
++    }
++}
++
++/// P1 in A, and A and B converge on it; `key` must hold `want` so the oracle is not vacuous.
++fn assert_p1_and_converged(run: &Merged, key: &str, want: &str) {
++    assert_eq!(run.without_i2.get(key).map(String::as_str), Some(want));
++    assert_eq!(observe(&run.a, &run.doc), run.without_i2);
++    assert_eq!(observe(&run.b, &run.doc), observe(&run.a, &run.doc));
++}
++
++#[test]
++fn undoing_a_key_beside_a_peers_key_restores_it_and_keeps_theirs() {
++    let run = merged(
++        |tx, root| tx.put(root, "x", "base"),
++        |tx, root| tx.put(root, "x", "two"),
++        |tx, root| tx.put(root, "y", "three"),
++    );
++
++    assert_p1_and_converged(&run, "x", "Str(\"base\")");
++}
++
++#[test]
++fn undoing_a_text_insert_beside_a_peers_insert_keeps_theirs() {
++    let run = merged(
++        |tx, root| {
++            let text = tx.put_object(root, "body", ObjType::Text)?;
++            tx.splice_text(&text, 0, 0, "one two three")
++        },
++        |tx, root| {
++            let text = body(tx, root)?;
++            tx.splice_text(&text, 3, 0, " mid")
++        },
++        |tx, root| {
++            let text = body(tx, root)?;
++            let end = tx.length(&text);
++            tx.splice_text(&text, end, 0, " end")
++        },
++    );
++
++    assert_p1_and_converged(&run, "body", "one two three end");
++}
++
++#[test]
++fn undoing_a_counter_step_beside_a_peers_step_keeps_theirs() {
++    let run = merged(
++        |tx, root| tx.put(root, "count", ScalarValue::counter(0)),
++        |tx, root| tx.increment(root, "count", 5),
++        |tx, root| tx.increment(root, "count", -2),
++    );
++
++    assert_p1_and_converged(&run, "count", "-2");
++}
++
++/// Fails for a document whose root carries the marker key `fail`, undoes the others as Tilo does.
++struct FailsOnMarked;
++
++impl ContentUndo for FailsOnMarked {
++    fn undo(&self, doc: &mut AutoCommit, changes: &[(ChangeHash, String)]) -> Result<(), String> {
++        if doc
++            .get(ROOT, "fail")
++            .map_err(|error| error.to_string())?
++            .is_some()
++        {
++            return Err("marked document".to_owned());
++        }
++        RevertContentUndo.undo(doc, changes)
++    }
++}
++
++/// Undoes i2 over the notes `a` and `b`, the one named `marked` refusing: the error leaves both
++/// notes, and their documents, as they were.
++fn assert_a_failed_undo_changes_nothing(marked: &str) {
++    let mut store = Store::new();
++    store.set_content_undo(Box::new(FailsOnMarked));
++    for id in ["a", "b"] {
++        store.put("note", id, resource(), &stamp("i1")).unwrap();
++    }
++    write(&mut store, marked, "i1", |tx, root| {
++        tx.put(root, "fail", true)
++    });
++    let docs =
++        ["a", "b"].map(|id| write(&mut store, id, "i2", |tx, root| tx.put(root, "v", "two")).doc);
++    let heads = |store: &Store| {
++        docs.clone()
++            .map(|doc| store.document(&doc).unwrap().get_heads())
++    };
++    let before = heads(&store);
++
++    let error = store.undo("i2", &stamp("undo-i2")).unwrap_err();
++
++    assert!(matches!(error, StoreError::Undo(_)));
++    for id in ["a", "b"] {
++        let expected = if id == marked {
++            json!({"fail": true, "v": "two"})
++        } else {
++            json!({"v": "two"})
++        };
++        assert_eq!(store.content_json("note", id), Some(expected));
++    }
++    assert_eq!(heads(&store), before);
++}
++
++#[test]
++fn a_failed_document_undoes_no_document() {
++    assert_a_failed_undo_changes_nothing("a");
++    assert_a_failed_undo_changes_nothing("b");
++}
++
++#[test]
++fn undoing_a_counter_step_in_one_store_keeps_a_later_step() {
++    let mut store = Store::new();
++    store.set_content_undo(Box::new(RevertContentUndo));
++    store.put("note", "n1", resource(), &stamp("i1")).unwrap();
++    let base = write(&mut store, "n1", "i1", |tx, root| {
++        tx.put(root, "count", ScalarValue::counter(0))
++    });
++    write(&mut store, "n1", "i2", |tx, root| {
++        tx.increment(root, "count", 5)
++    });
++    write(&mut store, "n1", "i3", |tx, root| {
++        tx.increment(root, "count", -2)
++    });
++
++    store.undo("i2", &stamp("undo-i2")).unwrap();
++
++    assert_eq!(
++        observe(&store, &base.doc).get("count").map(String::as_str),
++        Some("-2")
++    );
++}
+diff --git a/crates/server/tilo-workspace-service/tests/selective_undo_reactions.rs b/crates/server/tilo-workspace-service/tests/selective_undo_reactions.rs
+new file mode 100644
+index 0000000000..6fae047491
+--- /dev/null
++++ b/crates/server/tilo-workspace-service/tests/selective_undo_reactions.rs
+@@ -0,0 +1,259 @@
++#![cfg(feature = "apps")]
++#![allow(clippy::unwrap_used, reason = "test assertions")]
++
++//! One person's reaction undone on two devices that sync, with the commands a Chat reaction sends:
++//! the workspace service's content undo keeps the other person's reaction, and takes back the
++//! undone one even when that reaction made the map the other one was written into.
++
++use serde_json::{Value, json};
++use tilo_resource_store::wire::{self, Command, Edit};
++use tilo_resource_store::{Proposal, Received, Resource, Stamp, Store, Written};
++use tilo_workspace_service::workspaces::content_undo::RevertContentUndo;
++
++fn stamp(invocation: &str, who: &str) -> Stamp {
++    Stamp {
++        invocation: invocation.to_owned(),
++        invoker: who.to_owned(),
++        ..Stamp::default()
++    }
++}
++
++fn device(hook: bool) -> Store {
++    let mut store = Store::new();
++    if hook {
++        store.set_content_undo(Box::new(RevertContentUndo));
++    }
++    store
++}
++
++fn message_made(store: &mut Store) -> Vec<Written> {
++    let resource = Resource {
++        readers: "*".to_owned(),
++        ..Resource::default()
++    };
++    store
++        .put("message", "m1", resource, &stamp("made", "ada"))
++        .unwrap()
++}
++
++fn react(store: &mut Store, invocation: &str, who: &str) -> Vec<Written> {
++    let edit = Edit::MapPut {
++        field: "reactions".to_owned(),
++        key: format!("thumbs\u{1f}{who}"),
++        value: json!(true),
++    };
++    let command = Command::Edit {
++        kind: "message".to_owned(),
++        id: "m1".to_owned(),
++        edits: vec![edit],
++        stamp: stamp(invocation, who),
++    };
++    wire::write(store, command).unwrap()
++}
++
++fn undo(store: &mut Store, invocation: &str, who: &str) -> Vec<Written> {
++    let undo = Stamp {
++        verb: "undo".to_owned(),
++        undoes: Some(invocation.to_owned()),
++        ..stamp(&format!("undo-{invocation}"), who)
++    };
++    let command = Command::Undo {
++        invocation: invocation.to_owned(),
++        stamp: undo,
++    };
++    wire::write(store, command).unwrap()
++}
++
++fn deliver(store: &mut Store, writes: &[Written]) {
++    for written in writes {
++        let received = Received {
++            change: written.change.clone(),
++            author: [0; 32],
++        };
++        store
++            .receive(
++                &written.doc,
++                &written.readers,
++                vec![received],
++                &|_: &Proposal<'_>| true,
++            )
++            .unwrap();
++    }
++}
++
++fn people(store: &Store) -> Vec<String> {
++    let content = store.content_json("message", "m1").unwrap_or(Value::Null);
++    let mut names: Vec<String> = content
++        .get("reactions")
++        .and_then(Value::as_object)
++        .map(|map| {
++            map.keys()
++                .filter_map(|key| key.split('\u{1f}').nth(1).map(str::to_owned))
++                .collect()
++        })
++        .unwrap_or_default();
++    names.sort();
++    names
++}
++
++/// Ada reacts (after Cy, when `earlier`), Ben reacts, Ada undoes; the reactions each device sees.
++fn ada_undoes(hook: bool, earlier: bool) -> (Vec<String>, Vec<String>) {
++    let (mut ada, mut ben) = (device(hook), device(hook));
++    let base = message_made(&mut ada);
++    deliver(&mut ben, &base);
++    if earlier {
++        let cy = react(&mut ada, "cy-reacts", "cy");
++        deliver(&mut ben, &cy);
++    }
++    let reaction = react(&mut ada, "ada-reacts", "ada");
++    deliver(&mut ben, &reaction);
++    let reaction = react(&mut ben, "ben-reacts", "ben");
++    deliver(&mut ada, &reaction);
++    let undone = undo(&mut ada, "ada-reacts", "ada");
++    deliver(&mut ben, &undone);
++    (people(&ada), people(&ben))
++}
++
++fn both(names: &[&str]) -> (Vec<String>, Vec<String>) {
++    let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
++    (names.clone(), names)
++}
++
++#[test]
++fn todays_undo_takes_back_the_other_persons_reaction_too() {
++    assert_eq!(ada_undoes(false, false), both(&[]));
++    assert_eq!(ada_undoes(false, true), both(&["cy"]));
++}
++
++#[test]
++fn the_content_undo_takes_back_only_the_undone_reaction_when_it_made_the_map() {
++    assert_eq!(ada_undoes(true, false), both(&["ben"]));
++}
++
++#[test]
++fn the_content_undo_takes_back_only_the_undone_reaction_when_the_map_was_there() {
++    assert_eq!(ada_undoes(true, true), both(&["ben", "cy"]));
++}
++
++/// Ada's invocation makes a `box` map of a plain value and an object; Ben writes a plain value beside them; Ada undoes.
++fn a_map_with_an_object_in_it_survives_the_undo() -> serde_json::Value {
++    let (mut ada, mut ben) = (device(true), device(true));
++    let base = message_made(&mut ada);
++    deliver(&mut ben, &base);
++    let put = |field: &str, key: &str, value: Value| Edit::MapPut {
++        field: field.to_owned(),
++        key: key.to_owned(),
++        value,
++    };
++    let command = Command::Edit {
++        kind: "message".to_owned(),
++        id: "m1".to_owned(),
++        edits: vec![
++            put("box", "type", json!("paragraph")),
++            put("box", "text", json!({"words": "Figure 1"})),
++        ],
++        stamp: stamp("ada-box", "ada"),
++    };
++    let written = wire::write(&mut ada, command).unwrap();
++    deliver(&mut ben, &written);
++    let command = Command::Edit {
++        kind: "message".to_owned(),
++        id: "m1".to_owned(),
++        edits: vec![put("box", "align", json!("center"))],
++        stamp: stamp("ben-box", "ben"),
++    };
++    let written = wire::write(&mut ben, command).unwrap();
++    deliver(&mut ada, &written);
++    undo(&mut ada, "ada-box", "ada");
++    ada.content_json("message", "m1").unwrap_or(Value::Null)
++}
++
++#[test]
++fn a_map_holding_an_object_stays_whole_when_the_other_author_wrote_beside_it() {
++    let content = a_map_with_an_object_in_it_survives_the_undo();
++
++    assert_eq!(
++        content.get("box"),
++        Some(&json!({"type": "paragraph", "text": {"words": "Figure 1"}, "align": "center"}))
++    );
++}
++
++/// Writes `value` at the entry `key` of the map field `box` of the message, as `who`.
++fn put_entry(
++    store: &mut Store,
++    invocation: &str,
++    who: &str,
++    key: &str,
++    value: Value,
++) -> Vec<Written> {
++    let edit = Edit::MapPut {
++        field: "box".to_owned(),
++        key: key.to_owned(),
++        value,
++    };
++    let command = Command::Edit {
++        kind: "message".to_owned(),
++        id: "m1".to_owned(),
++        edits: vec![edit],
++        stamp: stamp(invocation, who),
++    };
++    wire::write(store, command).unwrap()
++}
++
++fn box_of(store: &Store) -> Value {
++    let content = store.content_json("message", "m1").unwrap_or(Value::Null);
++    content.get("box").cloned().unwrap_or(Value::Null)
++}
++
++#[test]
++fn an_entry_the_other_author_wrote_again_after_the_undone_invocation_survives_its_undo() {
++    let (mut ada, mut ben) = (device(true), device(true));
++    let base = message_made(&mut ada);
++    deliver(&mut ben, &base);
++    let first = put_entry(&mut ada, "ada-writes", "ada", "k", json!("one"));
++    deliver(&mut ben, &first);
++    let later = put_entry(&mut ben, "ben-writes", "ben", "k", json!("two"));
++    deliver(&mut ada, &later);
++    let undone = undo(&mut ada, "ada-writes", "ada");
++    deliver(&mut ben, &undone);
++
++    assert_eq!(box_of(&ada), json!({"k": "two"}));
++    assert_eq!(box_of(&ben), json!({"k": "two"}));
++}
++
++#[test]
++fn an_entry_the_other_author_wrote_at_the_same_time_with_the_same_value_survives_the_undo() {
++    let (mut ada, mut ben) = (device(true), device(true));
++    let base = message_made(&mut ada);
++    deliver(&mut ben, &base);
++    // One invocation of two changes: the first makes the map, the second writes the entry.
++    let made = put_entry(&mut ada, "ada-writes", "ada", "seed", json!(1));
++    deliver(&mut ben, &made);
++    let entry = put_entry(&mut ada, "ada-writes", "ada", "k", json!("same"));
++    let concurrent = put_entry(&mut ben, "ben-writes", "ben", "k", json!("same"));
++    deliver(&mut ada, &concurrent);
++    deliver(&mut ben, &entry);
++    let undone = undo(&mut ada, "ada-writes", "ada");
++    deliver(&mut ben, &undone);
++
++    assert_eq!(box_of(&ada), json!({"k": "same"}));
++    assert_eq!(box_of(&ben), json!({"k": "same"}));
++}
++
++#[test]
++fn an_entry_written_again_with_the_same_value_is_no_write_so_the_whole_map_goes() {
++    let (mut ada, mut ben) = (device(true), device(true));
++    let base = message_made(&mut ada);
++    deliver(&mut ben, &base);
++    let first = put_entry(&mut ada, "ada-writes", "ada", "k", json!("one"));
++    deliver(&mut ben, &first);
++    let again = put_entry(&mut ben, "ben-writes", "ben", "k", json!("one"));
++    deliver(&mut ada, &again);
++    let undone = undo(&mut ada, "ada-writes", "ada");
++    deliver(&mut ben, &undone);
++
++    // Automerge keeps no operation for a put of the value already there, so there is no write by
++    // Ben for the undo to protect. Nobody wrote into the map, so it goes whole.
++    assert_eq!(box_of(&ada), Value::Null);
++    assert_eq!(box_of(&ben), Value::Null);
++}
+diff --git a/crates/server/tilo-workspace-service/tests/selective_undo_store.rs b/crates/server/tilo-workspace-service/tests/selective_undo_store.rs
+new file mode 100644
+index 0000000000..10b7b45938
+--- /dev/null
++++ b/crates/server/tilo-workspace-service/tests/selective_undo_store.rs
+@@ -0,0 +1,706 @@
++#![cfg(any(feature = "agents", feature = "apps"))]
++#![allow(
++    clippy::unwrap_used,
++    clippy::expect_used,
++    clippy::arithmetic_side_effects,
++    clippy::indexing_slicing,
++    reason = "test assertions and a small generator"
++)]
++
++//! `Store::undo` with Tilo's revert installed, on the histories the selective-undo generator
++//! makes: one invocation is undone and the result is compared with a replay without it.
++
++use std::env;
++use std::ops::Range;
++use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++
++use automerge::transaction::{Transactable as _, Transaction};
++use automerge::{AutoCommit, ChangeHash, ObjId, ObjType, ReadDoc as _, ScalarValue};
++use serde_json::Value as JsonValue;
++use tilo_resource_store::{Admit, ContentUndo, Proposal, Received, Store};
++use tilo_workspace_service::workspaces::content_undo::RevertContentUndo;
++
++#[allow(dead_code, reason = "the generator serves more than one checker")]
++#[path = "../../../collab/resource-store/tests/selective_undo.rs"]
++mod undo_gen;
++
++use undo_gen::{Case, Commits, History, Invocation, Op, P1Outcome};
++
++fn install(store: &mut Store) {
++    store.set_content_undo(Box::new(RevertContentUndo));
++}
++
++fn violates(case: &Case, commits: Commits) -> bool {
++    matches!(
++        undo_gen::p1_outcome_with_commits(case, &install, commits),
++        Ok(P1Outcome::Violated)
++    )
++}
++
++/// A history of the base invocation, the target `i2` and one later invocation `i3`.
++fn case(target_ops: Vec<Op>, later_ops: Vec<Op>) -> Case {
++    let invocation = |id: &str, ops| Invocation {
++        id: id.to_owned(),
++        ops,
++    };
++    Case {
++        history: History {
++            invocations: vec![
++                invocation("i1", Vec::new()),
++                invocation("i2", target_ops),
++                invocation("i3", later_ops),
++            ],
++        },
++        target: "i2".to_owned(),
++    }
++}
++
++/// The content after undoing the target, with the hook installed.
++fn undone(case: &Case) -> JsonValue {
++    assert!(undo_gen::valid_history(&case.history));
++    let mut store = undo_gen::play_history(&case.history, None).unwrap();
++    install(&mut store);
++    store
++        .undo(&case.target, &undo_gen::undo_stamp(&case.target))
++        .unwrap();
++    undo_gen::observe(&store)
++}
++
++#[test]
++fn undoing_a_new_key_keeps_a_later_new_key() {
++    let case = case(
++        vec![Op::CreateMap {
++            parent: "i1:meta".to_owned(),
++            key: "k0".to_owned(),
++            name: "i2:c0".to_owned(),
++        }],
++        vec![Op::CreateMap {
++            parent: "i1:meta".to_owned(),
++            key: "k5".to_owned(),
++            name: "i3:c1".to_owned(),
++        }],
++    );
++
++    let after = undone(&case);
++
++    assert!(after["meta"].get("k5").is_some());
++    assert!(after["meta"].get("k0").is_none());
++    assert_eq!(undo_gen::p1_violation_with(&case, &install), Ok(false));
++}
++
++#[test]
++fn undoing_a_new_list_keeps_a_later_insert_into_items() {
++    let case = case(
++        vec![Op::CreateList {
++            parent: "i1:meta".to_owned(),
++            key: "k0".to_owned(),
++            name: "i2:c0".to_owned(),
++        }],
++        vec![Op::Insert {
++            target: "i1:items".to_owned(),
++            after: None,
++            value: "v1".to_owned(),
++        }],
++    );
++
++    let after = undone(&case);
++
++    assert_eq!(after["meta"]["items"], serde_json::json!(["v1"]));
++    assert!(after["meta"].get("k0").is_none());
++    assert_eq!(undo_gen::p1_violation_with(&case, &install), Ok(false));
++}
++
++/// What a run over a range of seeds found.
++struct Counts {
++    independent: u64,
++    p1_violations: u64,
++    p1_order_choices: u64,
++    replay_errors: u64,
++    first_counterexample: Option<Case>,
++}
++
++fn count_range(seeds: Range<u64>, commits: Commits) -> Counts {
++    let mut independent = 0_u64;
++    let mut p1_violations = 0_u64;
++    let mut p1_order_choices = 0_u64;
++    let mut replay_errors = 0_u64;
++    let mut first = None;
++
++    for seed in seeds {
++        let case = undo_gen::generate_case(seed);
++        if !undo_gen::analyse(&case.history, &case.target).independent {
++            continue;
++        }
++        independent += 1;
++        match undo_gen::p1_outcome_with_commits(&case, &install, commits) {
++            Ok(P1Outcome::Holds) => {}
++            Ok(P1Outcome::RestoredOrderOnly) => p1_order_choices += 1,
++            Ok(P1Outcome::Violated) => {
++                p1_violations += 1;
++                if first.is_none() {
++                    first = Some(undo_gen::shrink_by(case, &|candidate| {
++                        violates(candidate, commits)
++                    }));
++                }
++            }
++            Err(_) => replay_errors += 1,
++        }
++    }
++
++    Counts {
++        independent,
++        p1_violations,
++        p1_order_choices,
++        replay_errors,
++        first_counterexample: first,
++    }
++}
++
++const GATE_SEEDS: u64 = 1000;
++
++fn assert_gate(commits: Commits) {
++    let counts = count_range(0..GATE_SEEDS, commits);
++
++    assert!(
++        counts.independent > 0,
++        "no independent histories were generated"
++    );
++    assert_eq!(counts.replay_errors, 0, "histories failed to replay");
++    assert_eq!(
++        counts.p1_violations,
++        0,
++        "first counterexample: {}",
++        serde_json::json!(
++            counts
++                .first_counterexample
++                .as_ref()
++                .map(undo_gen::counterexample_json)
++        )
++    );
++}
++
++#[test]
++fn gate_selective_undo_store() {
++    assert_gate(Commits::One);
++}
++
++#[test]
++fn gate_selective_undo_store_per_op_commits() {
++    assert_gate(Commits::PerOp);
++}
++
++#[test]
++fn per_op_commits_write_one_change_per_op() {
++    let put = |key: &str| Op::PutKey {
++        target: "i1:props".to_owned(),
++        key: key.to_owned(),
++        value: format!("v-{key}"),
++    };
++    let case = case(vec![put("k0"), put("k1")], Vec::new());
++    let mut store = undo_gen::play_history_with(&case.history, None, Commits::PerOp).unwrap();
++
++    let message = undo_gen::stamped("i2").message();
++    let (doc, _) = store
++        .content(undo_gen::KIND, undo_gen::ID)
++        .unwrap()
++        .unwrap();
++    let changes = doc
++        .get_changes(&[])
++        .iter()
++        .filter(|change| change.message().is_some_and(|held| *held == message))
++        .count();
++    assert_eq!(changes, 2);
++
++    install(&mut store);
++    store
++        .undo(&case.target, &undo_gen::undo_stamp(&case.target))
++        .unwrap();
++    assert_eq!(
++        undo_gen::observe(&store)["meta"]["props"],
++        serde_json::json!({})
++    );
++}
++
++#[test]
++#[ignore = "a measurement: run it by name"]
++fn measure() {
++    let seeds = env::var("TILO_SEEDS")
++        .ok()
++        .and_then(|value| value.parse::<u64>().ok())
++        .unwrap_or(2000);
++    let counts = count_range(0..seeds, Commits::One);
++
++    assert_eq!(counts.p1_violations, 0);
++
++    let output = serde_json::json!({
++        "histories": seeds,
++        "independent": counts.independent,
++        "p1_violations": counts.p1_violations,
++        "p1_order_choices": counts.p1_order_choices,
++        "replay_errors": counts.replay_errors,
++        "first_counterexample": counts
++            .first_counterexample
++            .as_ref()
++            .map(undo_gen::counterexample_json),
++    });
++
++    println!("{output}");
++}
++
++fn put_key(key: &str) -> Op {
++    Op::PutKey {
++        target: "i1:props".to_owned(),
++        key: key.to_owned(),
++        value: format!("v-{key}"),
++    }
++}
++
++#[test]
++fn per_op_undo_keeps_later_change() {
++    let case = case(vec![put_key("k0"), put_key("k1")], vec![put_key("k2")]);
++    let mut store = undo_gen::play_history_with(&case.history, None, Commits::PerOp).unwrap();
++
++    install(&mut store);
++    store
++        .undo(&case.target, &undo_gen::undo_stamp(&case.target))
++        .unwrap();
++
++    assert_eq!(
++        undo_gen::observe(&store),
++        serde_json::json!({"meta": {"props": {"k2": "v-k2"}, "items": []}})
++    );
++}
++
++/// Whether the target made more than one change, and whether a later invocation wrote. Every
++/// invocation writes the one document, so a later invocation with ops touches the same document.
++fn coverage(case: &Case) -> (bool, bool) {
++    let mut invocations = case
++        .history
++        .invocations
++        .iter()
++        .skip_while(|invocation| invocation.id != case.target);
++    let target = invocations.next().expect("the target exists");
++    let later = invocations.any(|invocation| !invocation.ops.is_empty());
++    (target.ops.len() > 1, later)
++}
++
++/// The op kinds the generator produces, in the order `kind_of` numbers them.
++const OP_KINDS: [&str; 6] = [
++    "PutKey",
++    "DeleteKey",
++    "Insert",
++    "Delete",
++    "CreateMap",
++    "CreateList",
++];
++
++fn kind_of(op: &Op) -> usize {
++    match op {
++        Op::PutKey { .. } => 0,
++        Op::DeleteKey { .. } => 1,
++        Op::Insert { .. } => 2,
++        Op::Delete { .. } => 3,
++        Op::CreateMap { .. } => 4,
++        Op::CreateList { .. } => 5,
++    }
++}
++
++/// Which op kinds the target invocation has.
++fn target_op_kinds(case: &Case) -> [bool; OP_KINDS.len()] {
++    let target = case
++        .history
++        .invocations
++        .iter()
++        .find(|invocation| invocation.id == case.target)
++        .expect("the target exists");
++    let mut seen = [false; OP_KINDS.len()];
++    for op in &target.ops {
++        seen[kind_of(op)] = true;
++    }
++    seen
++}
++
++#[test]
++fn gate_coverage_reaches_required_categories() {
++    let mut multi_change_targets = 0_u64;
++    let mut later_writers = 0_u64;
++    let mut kind_counts = [0_u64; OP_KINDS.len()];
++
++    for seed in 0..GATE_SEEDS {
++        let case = undo_gen::generate_case(seed);
++        if !undo_gen::analyse(&case.history, &case.target).independent {
++            continue;
++        }
++        let (multi, later) = coverage(&case);
++        multi_change_targets += u64::from(multi);
++        later_writers += u64::from(later);
++        for (count, seen) in kind_counts.iter_mut().zip(target_op_kinds(&case)) {
++            *count += u64::from(seen);
++        }
++    }
++
++    println!("multi-change targets: {multi_change_targets}, later writers: {later_writers}");
++    assert!(multi_change_targets > 0, "no target made several changes");
++    assert!(later_writers > 0, "no later invocation wrote the document");
++
++    for (name, count) in OP_KINDS.iter().zip(kind_counts) {
++        println!("targets with a {name} op: {count}");
++        assert!(count > 0, "no target had a {name} op");
++    }
++}
++
++const DOC_A: &str = "a";
++const DOC_B: &str = "b";
++
++fn write(store: &mut Store, id: &str, invocation: &str, key: &str, value: &str) {
++    store
++        .edit_content(
++            undo_gen::KIND,
++            id,
++            &undo_gen::stamped(invocation),
++            |tx, root| tx.put(root, key, value),
++        )
++        .unwrap();
++}
++
++/// Two documents, each written by `i1` (the base), the target `i2` and a later `i3`.
++fn two_documents() -> Store {
++    let mut store = Store::new();
++    for id in [DOC_A, DOC_B] {
++        store
++            .put(
++                undo_gen::KIND,
++                id,
++                undo_gen::resource(),
++                &undo_gen::stamped("i1"),
++            )
++            .unwrap();
++        write(&mut store, id, "i1", "base", "base");
++    }
++    for (invocation, key) in [("i2", "target"), ("i3", "later")] {
++        for id in [DOC_A, DOC_B] {
++            write(&mut store, id, invocation, key, &format!("{key}-{id}"));
++        }
++    }
++    store
++}
++
++fn content_of(store: &Store, id: &str) -> Option<JsonValue> {
++    store.content_json(undo_gen::KIND, id)
++}
++
++fn heads(store: &mut Store, id: &str) -> Vec<ChangeHash> {
++    let (doc, _) = store.content(undo_gen::KIND, id).unwrap().unwrap();
++    doc.get_heads()
++}
++
++#[test]
++fn undo_of_a_two_document_invocation_keeps_later_changes() {
++    let mut store = two_documents();
++    install(&mut store);
++
++    store.undo("i2", &undo_gen::undo_stamp("i2")).unwrap();
++
++    assert_eq!(
++        content_of(&store, DOC_A),
++        Some(serde_json::json!({"base": "base", "later": "later-a"}))
++    );
++    assert_eq!(
++        content_of(&store, DOC_B),
++        Some(serde_json::json!({"base": "base", "later": "later-b"}))
++    );
++}
++
++/// Reverts like Tilo's hook, but fails on its second call, whichever document that is. It
++/// records the calls and whether the first one succeeded.
++struct FailsOnSecondCall {
++    calls: Arc<AtomicUsize>,
++    first_succeeded: Arc<AtomicBool>,
++}
++
++impl ContentUndo for FailsOnSecondCall {
++    fn undo(&self, doc: &mut AutoCommit, changes: &[(ChangeHash, String)]) -> Result<(), String> {
++        if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
++            return Err("second call".to_owned());
++        }
++        RevertContentUndo.undo(doc, changes)?;
++        self.first_succeeded.store(true, Ordering::SeqCst);
++        Ok(())
++    }
++}
++
++#[test]
++fn two_document_undo_is_all_or_nothing() {
++    let mut store = two_documents();
++    let calls = Arc::new(AtomicUsize::new(0));
++    let first_succeeded = Arc::new(AtomicBool::new(false));
++    store.set_content_undo(Box::new(FailsOnSecondCall {
++        calls: Arc::clone(&calls),
++        first_succeeded: Arc::clone(&first_succeeded),
++    }));
++    let heads_before = [heads(&mut store, DOC_A), heads(&mut store, DOC_B)];
++
++    assert!(store.undo("i2", &undo_gen::undo_stamp("i2")).is_err());
++
++    assert_eq!(calls.load(Ordering::SeqCst), 2);
++    assert!(first_succeeded.load(Ordering::SeqCst));
++    assert_eq!(
++        content_of(&store, DOC_A),
++        Some(serde_json::json!({
++            "base": "base",
++            "target": "target-a",
++            "later": "later-a"
++        }))
++    );
++    assert_eq!(
++        content_of(&store, DOC_B),
++        Some(serde_json::json!({
++            "base": "base",
++            "target": "target-b",
++            "later": "later-b"
++        }))
++    );
++    let heads_after = [heads(&mut store, DOC_A), heads(&mut store, DOC_B)];
++    assert_eq!(heads_after, heads_before);
++}
++
++/// A defective hook: reverts only the first document it is called for and reports success.
++struct FirstDocumentOnly {
++    reverted: AtomicBool,
++}
++
++impl ContentUndo for FirstDocumentOnly {
++    fn undo(&self, doc: &mut AutoCommit, changes: &[(ChangeHash, String)]) -> Result<(), String> {
++        if self.reverted.swap(true, Ordering::SeqCst) {
++            return Ok(());
++        }
++        RevertContentUndo.undo(doc, changes)
++    }
++}
++
++/// What the two documents hold once the target is undone in both.
++fn expected_after_undo() -> (JsonValue, JsonValue) {
++    (
++        serde_json::json!({"base": "base", "later": "later-a"}),
++        serde_json::json!({"base": "base", "later": "later-b"}),
++    )
++}
++
++#[test]
++fn first_document_only_undo_is_detected() {
++    let mut store = two_documents();
++    store.set_content_undo(Box::new(FirstDocumentOnly {
++        reverted: AtomicBool::new(false),
++    }));
++
++    store.undo("i2", &undo_gen::undo_stamp("i2")).unwrap();
++
++    let (expected_a, expected_b) = expected_after_undo();
++    let meets_expectations = content_of(&store, DOC_A) == Some(expected_a)
++        && content_of(&store, DOC_B) == Some(expected_b);
++    assert!(!meets_expectations);
++}
++
++fn history_case(invocations: Vec<(&str, Vec<Op>)>, target: &str) -> Case {
++    Case {
++        history: History {
++            invocations: invocations
++                .into_iter()
++                .map(|(id, ops)| Invocation {
++                    id: id.to_owned(),
++                    ops,
++                })
++                .collect(),
++        },
++        target: target.to_owned(),
++    }
++}
++
++fn insert_item(value: &str, after: Option<&str>) -> Op {
++    Op::Insert {
++        target: "i1:items".to_owned(),
++        after: after.map(str::to_owned),
++        value: value.to_owned(),
++    }
++}
++
++#[test]
++fn replay_without_target_is_hand_checked() {
++    let case = history_case(
++        vec![
++            ("i1", Vec::new()),
++            ("i2", vec![insert_item("v1", None)]),
++            ("i3", vec![insert_item("v2", None)]),
++            ("i4", vec![insert_item("v3", Some("v1")), put_key("k0")]),
++        ],
++        "i3",
++    );
++    let expected = serde_json::json!({"meta": {"props": {"k0": "v-k0"}, "items": ["v1", "v3"]}});
++
++    let replayed = undo_gen::play_history(&case.history, Some("i3")).unwrap();
++
++    assert_eq!(undo_gen::observe(&replayed), expected);
++    assert_eq!(undone(&case), expected);
++}
++
++fn undo_step(store: &mut Store, invocation: &str) {
++    store
++        .undo(invocation, &undo_gen::undo_stamp(invocation))
++        .unwrap();
++}
++
++#[test]
++fn undo_of_an_undo_restores_the_target() {
++    let case = case(vec![put_key("k0")], vec![put_key("k1")]);
++    let mut store = undo_gen::play_history(&case.history, None).unwrap();
++    install(&mut store);
++    assert_eq!(
++        undo_gen::observe(&store),
++        serde_json::json!({"meta": {"props": {"k0": "v-k0", "k1": "v-k1"}, "items": []}})
++    );
++
++    undo_step(&mut store, "i2");
++    assert_eq!(
++        undo_gen::observe(&store),
++        serde_json::json!({"meta": {"props": {"k1": "v-k1"}, "items": []}})
++    );
++
++    // The undo's changes carry the invocation `u-i2`, so it can be undone like any invocation.
++    undo_step(&mut store, "u-i2");
++    assert_eq!(
++        undo_gen::observe(&store),
++        serde_json::json!({"meta": {"props": {"k0": "v-k0", "k1": "v-k1"}, "items": []}})
++    );
++}
++
++fn items_list(tx: &Transaction<'_>, root: &ObjId) -> ObjId {
++    tx.get(root, "items")
++        .unwrap()
++        .expect("the items list exists")
++        .1
++}
++
++#[test]
++fn undo_keeps_a_list_counter_a_later_invocation_replaced() {
++    let mut store = Store::new();
++    install(&mut store);
++    store
++        .put(
++            undo_gen::KIND,
++            undo_gen::ID,
++            undo_gen::resource(),
++            &undo_gen::stamped("i1"),
++        )
++        .unwrap();
++    store
++        .edit_content(
++            undo_gen::KIND,
++            undo_gen::ID,
++            &undo_gen::stamped("i1"),
++            |tx, root| {
++                let items = tx.put_object(root, "items", ObjType::List)?;
++                tx.insert(&items, 0, ScalarValue::counter(0))
++            },
++        )
++        .unwrap();
++    store
++        .edit_content(
++            undo_gen::KIND,
++            undo_gen::ID,
++            &undo_gen::stamped("i2"),
++            |tx, root| {
++                let items = items_list(tx, root);
++                tx.increment(&items, 0_usize, 5)
++            },
++        )
++        .unwrap();
++    store
++        .edit_content(
++            undo_gen::KIND,
++            undo_gen::ID,
++            &undo_gen::stamped("i3"),
++            |tx, root| {
++                let items = items_list(tx, root);
++                tx.put(&items, 0_usize, "replaced")
++            },
++        )
++        .unwrap();
++
++    undo_step(&mut store, "i2");
++
++    assert_eq!(
++        content_of(&store, undo_gen::ID),
++        Some(serde_json::json!({"items": ["replaced"]}))
++    );
++}
++
++/// Admits every change: the test is about what undo keeps, not about who may write.
++struct AllowAll;
++
++impl Admit for AllowAll {
++    fn admit(&self, _: &Proposal<'_>) -> bool {
++        true
++    }
++}
++
++#[test]
++fn undo_keeps_an_edit_delivered_by_receive() {
++    let edit = |store: &mut Store, invocation: &str, key: &str| {
++        store
++            .edit_content(
++                undo_gen::KIND,
++                undo_gen::ID,
++                &undo_gen::stamped(invocation),
++                |tx, root| tx.put(root, key, key),
++            )
++            .unwrap()
++            .1
++            .expect("the edit wrote a change")
++    };
++    let mut store = Store::new();
++    let resource_doc = store
++        .put(
++            undo_gen::KIND,
++            undo_gen::ID,
++            undo_gen::resource(),
++            &undo_gen::stamped("i1"),
++        )
++        .unwrap()
++        .remove(0);
++    edit(&mut store, "i1", "base");
++    let target = edit(&mut store, "i2", "target");
++
++    // A second store starts from the same documents and makes a later edit of its own.
++    let mut other = Store::new();
++    for doc in [&resource_doc.doc, &target.doc] {
++        let bytes = store.document(doc).unwrap().save();
++        other.load(doc, &bytes).unwrap();
++    }
++    let later = edit(&mut other, "i3", "later");
++
++    let refused = store
++        .receive(
++            &target.doc,
++            &target.readers,
++            vec![Received {
++                change: later.change,
++                author: [0; 32],
++            }],
++            &AllowAll,
++        )
++        .unwrap();
++    assert!(refused.is_empty());
++    assert_eq!(
++        content_of(&store, undo_gen::ID),
++        Some(serde_json::json!({"base": "base", "target": "target", "later": "later"}))
++    );
++
++    install(&mut store);
++    undo_step(&mut store, "i2");
++
++    assert_eq!(
++        content_of(&store, undo_gen::ID),
++        Some(serde_json::json!({"base": "base", "later": "later"}))
++    );
++}
+diff --git a/crates/server/tilo-workspace-service/tests/selective_undo_text_counter.rs b/crates/server/tilo-workspace-service/tests/selective_undo_text_counter.rs
+new file mode 100644
+index 0000000000..0b5bab63fa
+--- /dev/null
++++ b/crates/server/tilo-workspace-service/tests/selective_undo_text_counter.rs
+@@ -0,0 +1,588 @@
++#![cfg(any(feature = "agents", feature = "apps"))]
++#![allow(
++    clippy::unwrap_used,
++    clippy::expect_used,
++    clippy::arithmetic_side_effects,
++    clippy::indexing_slicing,
++    reason = "test assertions and a small generator"
++)]
++
++//! Selective undo of counters and texts, today (no hook) and with Tilo's revert installed: a
++//! seeded generator makes a history, one invocation is undone, and the content is compared with
++//! a replay of the history without it.
++
++use std::env;
++use std::ops::Range;
++
++use automerge::transaction::Transactable as _;
++use automerge::{ObjType, ReadDoc as _, ScalarValue};
++use serde_json::{Value as JsonValue, json};
++use tilo_resource_store::{Resource, Stamp, Store};
++use tilo_workspace_service::workspaces::content_undo::RevertContentUndo;
++
++const DELTAS: [i64; 6] = [-3, -2, -1, 1, 2, 3];
++const BASE: [&str; 4] = ["b0", "b1", "b2", "b3"];
++const GATE_SEEDS: u64 = 1000;
++
++/// A splitmix64 generator: the same seed gives the same history.
++struct Rng(u64);
++
++impl Rng {
++    fn next(&mut self) -> u64 {
++        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
++        let mut z = self.0;
++        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
++        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
++        z ^ (z >> 31)
++    }
++
++    fn below(&mut self, n: usize) -> usize {
++        let bound = u64::try_from(n).expect("fits");
++        usize::try_from(self.next() % bound).expect("below n")
++    }
++}
++
++fn seeds() -> u64 {
++    env::var("TILO_SEEDS")
++        .ok()
++        .and_then(|value| value.parse().ok())
++        .unwrap_or(1000)
++}
++
++fn stamp(invocation: &str) -> Stamp {
++    Stamp {
++        invocation: invocation.to_owned(),
++        ..Stamp::default()
++    }
++}
++
++/// The id of the invocation that made operation `index`: `i1` made the base.
++fn invocation(index: usize) -> String {
++    format!("i{}", index + 2)
++}
++
++/// A store holding the note `n1`, with the hook installed or not.
++fn new_store(hook: bool) -> Store {
++    let mut store = Store::new();
++    if hook {
++        store.set_content_undo(Box::new(RevertContentUndo));
++    }
++    let resource = Resource {
++        readers: "*".to_owned(),
++        ..Resource::default()
++    };
++    store.put("note", "n1", resource, &stamp("i1")).unwrap();
++    store
++}
++
++fn field(store: &Store, name: &str) -> Option<JsonValue> {
++    Some(store.content_json("note", "n1")?[name].clone())
++}
++
++// Case 1: counters.
++
++struct CounterCase {
++    deltas: Vec<i64>,
++    target: usize,
++}
++
++impl CounterCase {
++    /// The sum of every increment but the target's.
++    fn expected(&self) -> i64 {
++        let others = self.deltas.iter().enumerate();
++        others
++            .filter(|(index, _)| *index != self.target)
++            .map(|(_, delta)| delta)
++            .sum()
++    }
++}
++
++fn counter_case(seed: u64) -> CounterCase {
++    let mut rng = Rng(seed);
++    let count = 2 + rng.below(5);
++    let deltas = (0..count)
++        .map(|_| DELTAS[rng.below(DELTAS.len())])
++        .collect();
++    CounterCase {
++        deltas,
++        target: rng.below(count),
++    }
++}
++
++fn counter_store(case: &CounterCase, hook: bool) -> Store {
++    let mut store = new_store(hook);
++    store
++        .edit_content("note", "n1", &stamp("i1"), |tx, root| {
++            tx.put(root, "count", ScalarValue::counter(0))
++        })
++        .unwrap();
++    for (index, delta) in case.deltas.iter().enumerate() {
++        store
++            .edit_content("note", "n1", &stamp(&invocation(index)), |tx, root| {
++                tx.increment(root, "count", *delta)
++            })
++            .unwrap();
++    }
++    store
++}
++
++fn count(store: &Store) -> Option<i64> {
++    field(store, "count")?.as_i64()
++}
++
++/// The count after undoing the target; `None` when the undo fails.
++fn undone_count(case: &CounterCase, hook: bool) -> Option<i64> {
++    let mut store = counter_store(case, hook);
++    let undo = stamp("undo");
++    store.undo(&invocation(case.target), &undo).ok()?;
++    count(&store)
++}
++
++fn counter_example(case: &CounterCase, expected: i64, got: Option<i64>) -> JsonValue {
++    json!({
++        "deltas": case.deltas,
++        "target": invocation(case.target),
++        "expected": expected,
++        "got": got,
++    })
++}
++
++// Case 2: texts. A text is words, each followed by a space.
++
++#[derive(Debug)]
++enum Op {
++    Insert { after: String, word: String },
++    Delete { word: String },
++}
++
++struct TextCase {
++    ops: Vec<Op>,
++    target: usize,
++}
++
++fn base_words() -> Vec<String> {
++    BASE.iter().map(|word| (*word).to_owned()).collect()
++}
++
++fn render(words: &[String]) -> String {
++    words
++        .iter()
++        .fold(String::new(), |text, word| text + word + " ")
++}
++
++fn offset(words: &[String]) -> usize {
++    words.iter().map(|word| word.len() + 1).sum()
++}
++
++/// Applies `op` to the words and answers the splice (position, deleted length, inserted text)
++/// that makes the same change to the text.
++fn step(words: &mut Vec<String>, op: &Op) -> (usize, usize, String) {
++    match op {
++        Op::Insert { after, word } => {
++            let index = words
++                .iter()
++                .position(|other| other == after)
++                .map_or(0, |at| at + 1);
++            let at = offset(&words[..index]);
++            words.insert(index, word.clone());
++            (at, 0, format!("{word} "))
++        }
++        Op::Delete { word } => {
++            let index = words
++                .iter()
++                .position(|other| other == word)
++                .expect("a deleted word is present");
++            let at = offset(&words[..index]);
++            words.remove(index);
++            (at, word.len() + 1, String::new())
++        }
++    }
++}
++
++/// Either deletes a base word (never the last word) or inserts a new unique word after any word.
++fn next_op(rng: &mut Rng, words: &[String], n: usize) -> Op {
++    let deletable: Vec<&String> = words.iter().filter(|word| word.starts_with('b')).collect();
++    if words.len() > 1 && !deletable.is_empty() && rng.below(2) == 0 {
++        return Op::Delete {
++            word: deletable[rng.below(deletable.len())].clone(),
++        };
++    }
++    Op::Insert {
++        after: words[rng.below(words.len())].clone(),
++        word: format!("n{n}"),
++    }
++}
++
++fn text_case(seed: u64) -> TextCase {
++    let mut rng = Rng(seed);
++    let count = 2 + rng.below(4);
++    let mut words = base_words();
++    let mut ops = Vec::new();
++    for n in 0..count {
++        let op = next_op(&mut rng, &words, n);
++        step(&mut words, &op);
++        ops.push(op);
++    }
++    TextCase {
++        ops,
++        target: rng.below(count),
++    }
++}
++
++/// The words next to `word` just before the target ran.
++fn neighbours(case: &TextCase, word: &str) -> Vec<String> {
++    let mut words = base_words();
++    for op in &case.ops[..case.target] {
++        step(&mut words, op);
++    }
++    let at = words.iter().position(|other| other == word).unwrap();
++    [at.checked_sub(1), Some(at + 1)]
++        .into_iter()
++        .flatten()
++        .filter_map(|index| words.get(index).cloned())
++        .collect()
++}
++
++fn touches(op: &Op, word: &str) -> bool {
++    match op {
++        Op::Insert { after, .. } => after == word,
++        Op::Delete { word: gone } => gone == word,
++    }
++}
++
++/// No later operation builds on a word the target inserted or deletes next to one it deleted.
++fn independent(case: &TextCase) -> bool {
++    let later = &case.ops[case.target + 1..];
++    match &case.ops[case.target] {
++        Op::Insert { word, .. } => !later.iter().any(|op| touches(op, word)),
++        Op::Delete { word } => {
++            let near = neighbours(case, word);
++            !later
++                .iter()
++                .any(|op| matches!(op, Op::Delete { word: gone } if near.contains(gone)))
++        }
++    }
++}
++
++fn text_store(case: &TextCase, hook: bool) -> Store {
++    let mut store = new_store(hook);
++    let mut words = base_words();
++    let text = render(&words);
++    store
++        .edit_content("note", "n1", &stamp("i1"), |tx, root| {
++            let body = tx.put_object(root, "body", ObjType::Text)?;
++            tx.splice_text(&body, 0, 0, &text)
++        })
++        .unwrap();
++    for (index, op) in case.ops.iter().enumerate() {
++        let (at, deleted, inserted) = step(&mut words, op);
++        store
++            .edit_content("note", "n1", &stamp(&invocation(index)), |tx, root| {
++                let (_, body) = tx.get(root, "body")?.expect("the body exists");
++                // The parameter's integer type differs between automerge versions.
++                tx.splice_text(&body, at, deleted.try_into().unwrap(), &inserted)
++            })
++            .unwrap();
++    }
++    store
++}
++
++fn body(store: &Store) -> Option<String> {
++    field(store, "body")?.as_str().map(str::to_owned)
++}
++
++/// The text after undoing the target; `None` when the undo fails.
++fn undone_body(case: &TextCase, hook: bool) -> Option<String> {
++    let mut store = text_store(case, hook);
++    let undo = stamp("undo");
++    store.undo(&invocation(case.target), &undo).ok()?;
++    body(&store)
++}
++
++/// The text of a replay of the history without the target.
++fn replay_without_target(case: &TextCase) -> String {
++    let mut words = base_words();
++    for (index, op) in case.ops.iter().enumerate() {
++        if index != case.target {
++            step(&mut words, op);
++        }
++    }
++    render(&words)
++}
++
++enum Outcome {
++    Holds,
++    OrderOnly,
++    Violated,
++}
++
++fn sorted_words(text: &str) -> Vec<&str> {
++    let mut words: Vec<&str> = text.split_whitespace().collect();
++    words.sort_unstable();
++    words
++}
++
++/// The word the target inserted or deleted.
++fn target_word(case: &TextCase) -> &str {
++    match &case.ops[case.target] {
++        Op::Insert { word, .. } | Op::Delete { word } => word,
++    }
++}
++
++fn without<'a>(text: &'a str, word: &str) -> Vec<&'a str> {
++    text.split_whitespace()
++        .filter(|other| *other != word)
++        .collect()
++}
++
++/// The target's own word may land elsewhere (a restored word next to a later insert); every
++/// other word has to keep its place.
++fn classify(got: Option<&str>, expected: &str, moved: &str) -> Outcome {
++    match got {
++        Some(text) if text == expected => Outcome::Holds,
++        Some(text)
++            if sorted_words(text) == sorted_words(expected)
++                && without(text, moved) == without(expected, moved) =>
++        {
++            Outcome::OrderOnly
++        }
++        _ => Outcome::Violated,
++    }
++}
++
++fn text_example(case: &TextCase, expected: &str, got: Option<&str>) -> JsonValue {
++    json!({
++        "ops": case.ops.iter().map(|op| format!("{op:?}")).collect::<Vec<_>>(),
++        "target": invocation(case.target),
++        "expected": expected,
++        "got": got,
++    })
++}
++
++#[test]
++fn a_played_counter_history_reads_back_as_the_sum() {
++    let case = counter_case(7);
++
++    let store = counter_store(&case, false);
++
++    assert_eq!(count(&store), Some(case.deltas.iter().sum()));
++}
++
++#[test]
++fn a_played_text_history_reads_back_as_the_model() {
++    let case = text_case(7);
++    let mut words = base_words();
++    for op in &case.ops {
++        step(&mut words, op);
++    }
++
++    let store = text_store(&case, false);
++
++    assert_eq!(body(&store), Some(render(&words)));
++}
++
++/// What a run of counter histories found, with and without the hook.
++struct CounterCounts {
++    independent: u64,
++    today_violations: u64,
++    hook_violations: u64,
++    today_example: Option<JsonValue>,
++    hook_example: Option<JsonValue>,
++}
++
++fn count_counter(seeds: Range<u64>) -> CounterCounts {
++    let mut independent = 0_u64;
++    let mut today_violations = 0_u64;
++    let mut hook_violations = 0_u64;
++    let mut today_example = None;
++    let mut hook_example = None;
++
++    for seed in seeds {
++        independent += 1;
++        let case = counter_case(seed);
++        let expected = case.expected();
++        let today = undone_count(&case, false);
++        let hooked = undone_count(&case, true);
++        if today != Some(expected) {
++            today_violations += 1;
++            today_example.get_or_insert_with(|| counter_example(&case, expected, today));
++        }
++        if hooked != Some(expected) {
++            hook_violations += 1;
++            hook_example.get_or_insert_with(|| counter_example(&case, expected, hooked));
++        }
++    }
++
++    CounterCounts {
++        independent,
++        today_violations,
++        hook_violations,
++        today_example,
++        hook_example,
++    }
++}
++
++#[test]
++fn gate_counter() {
++    let counts = count_counter(0..GATE_SEEDS);
++
++    assert!(counts.independent > 0, "no histories were generated");
++    assert_eq!(
++        counts.hook_violations, 0,
++        "first counterexample: {:?}",
++        counts.hook_example
++    );
++}
++
++#[test]
++#[ignore = "a measurement: run it by name"]
++fn measure_counter() {
++    let seeds = seeds();
++    let counts = count_counter(0..seeds);
++
++    let output = json!({
++        "histories": seeds,
++        "independent": counts.independent,
++        "today_violations": counts.today_violations,
++        "hook_violations": counts.hook_violations,
++        "today_example": counts.today_example,
++        "hook_example": counts.hook_example,
++    });
++    println!("{output}");
++}
++
++/// What a run of text histories found, with and without the hook. The pairs hold the
++/// violations and the order-only differences.
++struct TextCounts {
++    independent: u64,
++    today: [u64; 2],
++    hook: [u64; 2],
++    today_example: Option<JsonValue>,
++    hook_example: Option<JsonValue>,
++}
++
++fn count_text(seeds: Range<u64>) -> TextCounts {
++    let mut independent_count = 0_u64;
++    let mut today = [0_u64; 2];
++    let mut hook = [0_u64; 2];
++    let mut today_example = None;
++    let mut hook_example = None;
++
++    for seed in seeds {
++        let case = text_case(seed);
++        if !independent(&case) {
++            continue;
++        }
++        independent_count += 1;
++        let expected = replay_without_target(&case);
++        let today_got = undone_body(&case, false);
++        let hook_got = undone_body(&case, true);
++        let tallies = [
++            (&mut today, &mut today_example, today_got),
++            (&mut hook, &mut hook_example, hook_got),
++        ];
++        for (tally, example, got) in tallies {
++            match classify(got.as_deref(), &expected, target_word(&case)) {
++                Outcome::Holds => {}
++                Outcome::OrderOnly => tally[1] += 1,
++                Outcome::Violated => {
++                    tally[0] += 1;
++                    example.get_or_insert_with(|| text_example(&case, &expected, got.as_deref()));
++                }
++            }
++        }
++    }
++
++    TextCounts {
++        independent: independent_count,
++        today,
++        hook,
++        today_example,
++        hook_example,
++    }
++}
++
++#[test]
++fn gate_text() {
++    let counts = count_text(0..GATE_SEEDS);
++
++    assert!(
++        counts.independent > 0,
++        "no independent histories were generated"
++    );
++    assert_eq!(
++        counts.hook[0], 0,
++        "first counterexample: {:?}",
++        counts.hook_example
++    );
++}
++
++#[test]
++#[ignore = "a measurement: run it by name"]
++fn measure_text() {
++    let seeds = seeds();
++    let counts = count_text(0..seeds);
++
++    let output = json!({
++        "histories": seeds,
++        "independent": counts.independent,
++        "today_violations": counts.today[0],
++        "hook_violations": counts.hook[0],
++        "today_order_only": counts.today[1],
++        "hook_order_only": counts.hook[1],
++        "today_example": counts.today_example,
++        "hook_example": counts.hook_example,
++    });
++    println!("{output}");
++}
++
++#[test]
++fn counter_undo_with_peer_increment() {
++    let case = CounterCase {
++        deltas: vec![5, -2],
++        target: 0,
++    };
++
++    assert_eq!(undone_count(&case, true), Some(-2));
++}
++
++#[test]
++fn text_undo_preserves_later_insert() {
++    let case = TextCase {
++        ops: vec![
++            Op::Insert {
++                after: "b0".to_owned(),
++                word: "n0".to_owned(),
++            },
++            Op::Insert {
++                after: "b2".to_owned(),
++                word: "n1".to_owned(),
++            },
++        ],
++        target: 0,
++    };
++
++    assert!(independent(&case));
++    assert_eq!(undone_body(&case, true), Some("b0 b1 b2 n1 b3 ".to_owned()));
++}
++
++#[test]
++fn a_moved_target_word_is_order_only_and_other_differences_are_violated() {
++    let reorder = classify(Some("b1 b0 "), "b0 b1 ", "b1");
++    let other_word = classify(Some("b0 b1 x9 "), "b0 b1 n1 ", "b1");
++    let missing_word = classify(Some("b0 b1 "), "b0 b1 n1 ", "b1");
++    let failed = classify(None, "b0 b1 ", "b1");
++
++    assert!(matches!(reorder, Outcome::OrderOnly));
++    assert!(matches!(other_word, Outcome::Violated));
++    assert!(matches!(missing_word, Outcome::Violated));
++    assert!(matches!(failed, Outcome::Violated));
++}
++
++#[test]
++fn a_later_word_moved_past_an_unrelated_word_is_violated() {
++    // The target restored b1. n1 is a later author's word and b2 is unrelated to the target.
++    let moved = classify(Some("b0 b1 b2 n1 "), "b0 b1 n1 b2 ", "b1");
++
++    assert!(matches!(moved, Outcome::Violated));
++}

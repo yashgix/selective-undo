@@ -1,0 +1,1077 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 2e181d52b3..bd003558f5 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2820,6 +2820,7 @@ dependencies = [
+  "tilo-media",
+  "tilo-process",
+  "tilo-resource",
++ "tilo-resource-store",
+  "tilo-rt",
+  "tilo-seal",
+  "tilo-sort",
+diff --git a/crates/collab/collaboration/Cargo.toml b/crates/collab/collaboration/Cargo.toml
+index 85cb44f3c1..27b1c72508 100644
+--- a/crates/collab/collaboration/Cargo.toml
++++ b/crates/collab/collaboration/Cargo.toml
+@@ -91,6 +91,8 @@ uuid.workspace = true
+ tilo-app-id = { version = "0.1.0", path = "../../platform/tilo-app-id" }
+ 
+ [dev-dependencies]
++# The selective-undo generator replays histories in the store (tests only: the web start module links no store).
++tilo-resource-store = { version = "0.1.0", path = "../resource-store" }
+ tempfile.workspace = true
+ libc.workspace = true
+ tokio = { workspace = true, features = ["test-util"] }
+diff --git a/crates/collab/collaboration/src/history_source/revert.rs b/crates/collab/collaboration/src/history_source/revert.rs
+index 277fadf4cd..23eacd2caf 100644
+--- a/crates/collab/collaboration/src/history_source/revert.rs
++++ b/crates/collab/collaboration/src/history_source/revert.rs
+@@ -73,6 +73,10 @@ pub enum Slot {
+     /// written inside. Undoing the run would remove the container and take
+     /// their work with it, so the container stays.
+     Object(ObjId),
++    /// One element of a list, named by its cursor so the identity survives
++    /// index shifts. Another writer replacing or deleting it overwrites our
++    /// change to it; their increments do not.
++    Element(ObjId, String),
+ }
+ 
+ /// A slot the revert declined to touch, and why.
+@@ -207,6 +211,50 @@ fn slot_of(p: &Patch) -> Option<Slot> {
+     }
+ }
+ 
++/// The list element at `index` as of `heads`, named by its cursor.
++fn element_slot(doc: &AutoCommit, obj: &ObjId, index: usize, heads: &[ChangeHash]) -> Option<Slot> {
++    if !matches!(doc.object_type(obj), Ok(ObjType::List)) {
++        return None;
++    }
++    let cursor = doc.get_cursor(obj, index, Some(heads)).ok()?;
++    Some(Slot::Element(obj.clone(), cursor.to_string()))
++}
++
++/// The list elements a later change `p` (read between `lo` and `hi`) replaced,
++/// deleted or incremented.
++fn element_slots(
++    doc: &AutoCommit,
++    p: &Patch,
++    (lo, hi): (&[ChangeHash], &[ChangeHash]),
++) -> Vec<Slot> {
++    // A replaced or deleted element is named before the change: after a
++    // replacement the cursor at that index names the new value, not the element.
++    let (indices, heads) = match &p.action {
++        PatchAction::Increment {
++            prop: Prop::Seq(index),
++            ..
++        } => (*index..index.saturating_add(1), hi),
++        PatchAction::PutSeq { index, .. } => (*index..index.saturating_add(1), lo),
++        PatchAction::DeleteSeq { index, length } => (*index..index.saturating_add(*length), lo),
++        _ => return Vec::new(),
++    };
++    indices
++        .filter_map(|index| element_slot(doc, &p.obj, index, heads))
++        .collect()
++}
++
++/// The list element a counter increment in the inverse patch `p` lands on.
++fn element_increment(doc: &AutoCommit, p: &Patch, heads: &[ChangeHash]) -> Option<Slot> {
++    let PatchAction::Increment {
++        prop: Prop::Seq(index),
++        ..
++    } = &p.action
++    else {
++        return None;
++    };
++    element_slot(doc, &p.obj, *index, heads)
++}
++
+ /// Whether `p` writes a text object's characters: what [`text::rewritten`]
+ /// decides for the whole text.
+ fn writes_text(doc: &AutoCommit, p: &Patch) -> bool {
+@@ -226,11 +274,15 @@ fn writes_text(doc: &AutoCommit, p: &Patch) -> bool {
+ /// two members a prefix can have several concurrent frontiers.
+ fn first_index_after(doc: &mut AutoCommit, after: &[ChangeHash], total: usize) -> usize {
+     let after_set: HashSet<ChangeHash> = after.iter().copied().collect();
+-    for i in 0..total {
+-        let hs: HashSet<ChangeHash> = tilo_resource::history::prefix_heads(doc, i)
+-            .into_iter()
+-            .collect();
+-        if hs == after_set {
++    // The heads of each prefix, kept as the prefix grows: a change leaves them when a later
++    // change depends on it. Rebuilding them per prefix made this quadratic in the history.
++    let mut heads: HashSet<ChangeHash> = HashSet::new();
++    for (i, meta) in doc.get_changes_meta(&[]).iter().take(total).enumerate() {
++        for dep in &meta.deps {
++            heads.remove(dep);
++        }
++        heads.insert(meta.hash);
++        if heads == after_set {
+             // `i < total` inside this loop, so this never saturates.
+             return i.saturating_add(1);
+         }
+@@ -290,6 +342,8 @@ pub(crate) fn objects_of_change(
+ struct Later {
+     /// Each slot, with the first actor that wrote it.
+     slots: HashMap<Slot, String>,
++    /// Like `slots`, without increments: those commute, so they overwrite nothing.
++    overwrites: HashMap<Slot, String>,
+     /// What changes made with the run in their history typed and deleted
+     /// in each text object.
+     text: HashMap<ObjId, text::LaterText>,
+@@ -375,6 +429,7 @@ fn later_writers(
+         HashSet::new()
+     };
+     let mut out: HashMap<Slot, String> = HashMap::new();
++    let mut overwrites: HashMap<Slot, String> = HashMap::new();
+     let mut typed: HashMap<ObjId, text::LaterText> = HashMap::new();
+     for i in start_at..versions.len() {
+         // `i` is always `< versions.len()` by the loop bound; retain the
+@@ -417,7 +472,15 @@ fn later_writers(
+             text::record_later(doc, &patches, (&lo, &hi), &v.actor, &mut typed);
+         }
+         for p in &patches {
+-            if let Some(s) = slot_of(p) {
++            let slots = slot_of(p)
++                .into_iter()
++                .chain(element_slots(doc, p, (&lo, &hi)));
++            for s in slots {
++                if !matches!(p.action, PatchAction::Increment { .. }) {
++                    overwrites
++                        .entry(s.clone())
++                        .or_insert_with(|| v.actor.clone());
++                }
+                 out.entry(s).or_insert_with(|| v.actor.clone());
+             }
+             // Every created ancestor is protected: the inverse deletes the
+@@ -433,6 +496,7 @@ fn later_writers(
+     }
+     Later {
+         slots: out,
++        overwrites,
+         text: typed,
+     }
+ }
+@@ -482,7 +546,11 @@ fn blocked_container(
+ fn classify(
+     doc: &AutoCommit,
+     inverse: Vec<Patch>,
+-    (later, rewritten): (&HashMap<Slot, String>, &HashMap<ObjId, String>),
++    (later, overwrites, rewritten): (
++        &HashMap<Slot, String>,
++        &HashMap<Slot, String>,
++        &HashMap<ObjId, String>,
++    ),
+     after: &[ChangeHash],
+     covered: usize,
+     authors: &dyn ResolveAuthor,
+@@ -493,8 +561,18 @@ fn classify(
+     let mut kept_seen: HashSet<Slot> = HashSet::new();
+     let mut reverted_slots: HashSet<Slot> = HashSet::new();
+     let mut structural = 0usize;
++    // Map keys whose container stays: what the inverse would write beneath them belongs to the
++    // container the run replaced, and would land in the one that stays.
++    let mut held_back: HashSet<(ObjId, String)> = HashSet::new();
+ 
+     for p in inverse {
++        if p.path.iter().any(|(obj, prop)| match prop {
++            Prop::Map(key) => held_back.contains(&(obj.clone(), key.clone())),
++            Prop::Seq(_) => false,
++        }) {
++            writable.push((p, false));
++            continue;
++        }
+         // Removals first: they are the patches that can destroy a container.
+         match &p.action {
+             PatchAction::Insert { index, values }
+@@ -554,6 +632,7 @@ fn classify(
+                 if let Some((slot, actor)) =
+                     blocked_container(doc, after, &p.obj, key.as_str(), later)
+                 {
++                    held_back.insert((p.obj.clone(), key.clone()));
+                     if kept_seen.insert(slot.clone()) {
+                         kept.push(KeptSlot {
+                             by: authors.resolve(&actor),
+@@ -585,8 +664,14 @@ fn classify(
+             }
+             continue;
+         }
+-        if let Some(s) = slot_of(&p) {
+-            if let Some(actor) = later.get(&s) {
++        if let Some(s) = slot_of(&p).or_else(|| element_increment(doc, &p, after)) {
++            // Increments commute: another author's increment overwrites nothing of ours.
++            let writers = if matches!(p.action, PatchAction::Increment { .. }) {
++                overwrites
++            } else {
++                later
++            };
++            if let Some(actor) = writers.get(&s) {
+                 if kept_seen.insert(s.clone()) {
+                     kept.push(KeptSlot {
+                         by: authors.resolve(actor),
+@@ -655,7 +740,7 @@ fn plan(
+     classify(
+         doc,
+         inverse,
+-        (&later.slots, &rewritten),
++        (&later.slots, &later.overwrites, &rewritten),
+         after,
+         covered,
+         authors,
+diff --git a/crates/collab/collaboration/tests/selective_revert.rs b/crates/collab/collaboration/tests/selective_revert.rs
+new file mode 100644
+index 0000000000..14f5f08b2d
+--- /dev/null
++++ b/crates/collab/collaboration/tests/selective_revert.rs
+@@ -0,0 +1,851 @@
++#![allow(
++    clippy::unwrap_used,
++    clippy::expect_used,
++    clippy::arithmetic_side_effects,
++    clippy::panic,
++    reason = "test assertions and a small generator"
++)]
++
++//! Tilo's own `revert_changes` on the histories the selective-undo generator makes: one
++//! invocation is reverted in a plain automerge document, and the result is compared with a
++//! replay of the history without that invocation.
++
++use std::collections::HashMap;
++use std::env;
++use std::ops::Range;
++
++use automerge::transaction::Transactable as _;
++use automerge::{
++    ActorId, AutoCommit, AutomergeError, ChangeHash, ObjId, ObjType, ROOT, ReadDoc as _,
++    ScalarValue, Value,
++};
++use collaboration::history_source::authors::{HistoryAuthor, ResolveAuthor};
++use collaboration::history_source::revert::revert_changes;
++use serde_json::Value as JsonValue;
++use tilo_automerge::ApplyIncoming as _;
++
++#[allow(dead_code, reason = "the generator serves more than one checker")]
++#[path = "../../resource-store/tests/selective_undo.rs"]
++mod undo_gen;
++
++/// Names every actor by its hex, as the workspace service's content undo does.
++struct ActorNamed;
++
++impl ResolveAuthor for ActorNamed {
++    fn resolve(&self, actor: &str) -> HistoryAuthor {
++        HistoryAuthor::new(actor, 0.0, actor)
++    }
++}
++
++/// Whose actor id each invocation writes under.
++#[derive(Clone, Copy)]
++enum Authors {
++    /// One actor per invocation: later writers are other people.
++    Distinct,
++    /// One actor for everything: Tilo's same-author exemption applies.
++    Single,
++}
++
++fn actor_for(authors: Authors, invocation: &str) -> ActorId {
++    match authors {
++        Authors::Distinct => ActorId::from(invocation.as_bytes()),
++        Authors::Single => ActorId::from(b"writer".as_slice()),
++    }
++}
++
++/// A document being built invocation by invocation, with the generator's bookkeeping.
++struct Built {
++    doc: AutoCommit,
++    containers: HashMap<String, ObjId>,
++    list_values: HashMap<String, Vec<String>>,
++    model: undo_gen::Model,
++    /// Each invocation's changes with the actor hex that wrote them, oldest first.
++    changes: HashMap<String, Vec<(ChangeHash, String)>>,
++}
++
++impl Built {
++    fn new(actor: ActorId) -> Result<Self, AutomergeError> {
++        let mut doc = AutoCommit::new().with_actor(actor);
++        let mut containers = HashMap::new();
++        create_base(&mut doc, &mut containers)?;
++        doc.commit();
++        Ok(Self {
++            doc,
++            containers,
++            list_values: HashMap::new(),
++            model: undo_gen::base_model(),
++            changes: HashMap::new(),
++        })
++    }
++
++    fn run(&mut self, invocation: &undo_gen::Invocation, actor: ActorId) -> Result<(), String> {
++        let hex = actor.to_hex_string();
++        self.doc.set_actor(actor);
++        for op in &invocation.ops {
++            self.apply_op(op).map_err(|error| error.to_string())?;
++            undo_gen::apply_model(&mut self.model, op);
++        }
++        if let Some(hash) = self.doc.commit() {
++            self.changes
++                .entry(invocation.id.clone())
++                .or_default()
++                .push((hash, hex));
++        }
++        Ok(())
++    }
++
++    fn apply_op(&mut self, op: &undo_gen::Op) -> Result<(), AutomergeError> {
++        use undo_gen::Op;
++        match op {
++            Op::PutKey { target, key, value } => {
++                let map = undo_gen::lookup_container(&self.containers, target)?;
++                self.doc.put(&map, key.as_str(), value.as_str())?;
++            }
++            Op::DeleteKey { target, key } => {
++                let map = undo_gen::lookup_container(&self.containers, target)?;
++                self.doc.delete(&map, key.as_str())?;
++            }
++            Op::Insert {
++                target,
++                after,
++                value,
++            } => {
++                let list = undo_gen::lookup_container(&self.containers, target)?;
++                let entries = self.list_values.entry(target.clone()).or_default();
++                let index = insert_index(&self.model.lists, target, after.as_deref(), entries);
++                self.doc.insert(&list, index, value.as_str())?;
++                entries.insert(index, value.clone());
++            }
++            Op::Delete { target, value } => {
++                let list = undo_gen::lookup_container(&self.containers, target)?;
++                let entries = self.list_values.entry(target.clone()).or_default();
++                if let Some(index) = entries.iter().position(|item| item == value) {
++                    self.doc.delete(&list, index)?;
++                    entries.remove(index);
++                }
++            }
++            Op::CreateMap { parent, key, name } => {
++                let parent = undo_gen::lookup_container(&self.containers, parent)?;
++                let made = self.doc.put_object(&parent, key.as_str(), ObjType::Map)?;
++                self.containers.insert(name.clone(), made);
++            }
++            Op::CreateList { parent, key, name } => {
++                let parent = undo_gen::lookup_container(&self.containers, parent)?;
++                let made = self.doc.put_object(&parent, key.as_str(), ObjType::List)?;
++                self.containers.insert(name.clone(), made);
++                self.list_values.insert(name.clone(), Vec::new());
++            }
++        }
++        Ok(())
++    }
++}
++
++/// The structure `play_history` creates: a content map holding `meta` with `props` and `items`.
++fn create_base(
++    doc: &mut AutoCommit,
++    containers: &mut HashMap<String, ObjId>,
++) -> Result<(), AutomergeError> {
++    containers.insert(undo_gen::ROOT_LABEL.to_owned(), ROOT);
++    let meta = doc.put_object(ROOT, "meta", ObjType::Map)?;
++    let props = doc.put_object(&meta, "props", ObjType::Map)?;
++    let items = doc.put_object(&meta, "items", ObjType::List)?;
++    containers.insert("i1:meta".to_owned(), meta);
++    containers.insert("i1:props".to_owned(), props);
++    containers.insert("i1:items".to_owned(), items);
++    Ok(())
++}
++
++/// Where an element goes after `after`, as `play_history` places it.
++fn insert_index(
++    generator_lists: &std::collections::BTreeMap<String, Vec<String>>,
++    target: &str,
++    after: Option<&str>,
++    entries: &[String],
++) -> usize {
++    let Some(after) = after else {
++        return 0;
++    };
++    match entries.iter().position(|item| item == after) {
++        Some(position) => position + 1,
++        None => undo_gen::fallback_insert_index(generator_lists, target, after, entries),
++    }
++}
++
++fn build(history: &undo_gen::History, authors: Authors) -> Result<Built, String> {
++    let mut built = Built::new(actor_for(authors, "i1")).map_err(|error| error.to_string())?;
++    for invocation in history.invocations.iter().filter(|i| i.id != "i1") {
++        built.run(invocation, actor_for(authors, &invocation.id))?;
++    }
++    Ok(built)
++}
++
++/// Reverts the target's changes, newest first, and commits the result.
++fn revert_target(built: &mut Built, target: &str) -> Result<(), String> {
++    let mut changes = built.changes.get(target).cloned().unwrap_or_default();
++    changes.reverse();
++    built.doc.set_actor(ActorId::from(b"undo".as_slice()));
++    revert_changes(&mut built.doc, &changes, &ActorNamed).map_err(|error| format!("{error:?}"))?;
++    built.doc.commit();
++    Ok(())
++}
++
++/// The same canonical shape as `undo_gen::observe`.
++fn render(doc: &AutoCommit, obj: &ObjId) -> JsonValue {
++    match doc.object_type(obj) {
++        Ok(ObjType::Map | ObjType::Table) => JsonValue::Object(
++            doc.keys(obj)
++                .map(|key| {
++                    let found = doc.get(obj, key.as_str());
++                    (key, render_entry(doc, found))
++                })
++                .collect(),
++        ),
++        Ok(ObjType::List) => JsonValue::Array(
++            (0..doc.length(obj))
++                .map(|index| render_entry(doc, doc.get(obj, index)))
++                .collect(),
++        ),
++        Ok(ObjType::Text) => JsonValue::String(doc.text(obj).unwrap_or_default()),
++        Err(_) => JsonValue::Null,
++    }
++}
++
++fn render_entry(
++    doc: &AutoCommit,
++    found: Result<Option<(Value<'_>, ObjId)>, AutomergeError>,
++) -> JsonValue {
++    match found {
++        Ok(Some((Value::Object(_), id))) => render(doc, &id),
++        Ok(Some((Value::Scalar(scalar), _))) => match scalar.as_ref() {
++            ScalarValue::Str(text) => JsonValue::String(text.to_string()),
++            _ => JsonValue::Null,
++        },
++        _ => JsonValue::Null,
++    }
++}
++
++/// Whether reverting the target leaves what a replay without it gives.
++fn revert_matches_replay(case: &undo_gen::Case, authors: Authors) -> Result<bool, String> {
++    let mut built = build(&case.history, authors)?;
++    revert_target(&mut built, &case.target)?;
++    let without = undo_gen::play_history(&case.history, Some(&case.target))?;
++    Ok(render(&built.doc, &ROOT) == undo_gen::observe(&without))
++}
++
++/// What a run over a range of seeds found.
++struct Counts {
++    independent: u64,
++    violations: u64,
++    replay_errors: u64,
++    counterexamples: Vec<undo_gen::Case>,
++}
++
++/// The shrinker in the generator is tied to the store's undo, so counterexamples are unshrunk.
++fn count_range(authors: Authors, seeds: Range<u64>) -> Counts {
++    let mut independent = 0_u64;
++    let mut violations = 0_u64;
++    let mut replay_errors = 0_u64;
++    let mut counterexamples = Vec::new();
++
++    for seed in seeds {
++        let case = undo_gen::generate_case(seed);
++        if !undo_gen::analyse(&case.history, &case.target).independent {
++            continue;
++        }
++        independent += 1;
++        match revert_matches_replay(&case, authors) {
++            Ok(true) => {}
++            Ok(false) => {
++                violations += 1;
++                counterexamples.push(case);
++            }
++            Err(_) => replay_errors += 1,
++        }
++    }
++
++    counterexamples.sort_by_key(undo_gen::case_size);
++    Counts {
++        independent,
++        violations,
++        replay_errors,
++        counterexamples,
++    }
++}
++
++fn measure(authors: Authors, seeds: u64) -> JsonValue {
++    let counts = count_range(authors, 0..seeds);
++    serde_json::json!({
++        "histories": seeds,
++        "independent": counts.independent,
++        "p1_violations": counts.violations,
++        "replay_errors": counts.replay_errors,
++        "p1_counterexamples": counts
++            .counterexamples
++            .iter()
++            .take(3)
++            .map(undo_gen::counterexample_json)
++            .collect::<Vec<_>>(),
++    })
++}
++
++#[test]
++fn automerge_build_renders_like_the_store_replay() {
++    for seed in 0..50 {
++        let case = undo_gen::generate_case(seed);
++        let built = build(&case.history, Authors::Distinct).expect("history builds");
++        let store = undo_gen::play_history(&case.history, None).expect("history replays");
++        assert_eq!(
++            render(&built.doc, &ROOT),
++            undo_gen::observe(&store),
++            "seed {seed}"
++        );
++    }
++}
++
++/// Commits what `write` does under the actor named `name`, with the actor's hex.
++fn commit_as(
++    doc: &mut AutoCommit,
++    name: &str,
++    write: impl FnOnce(&mut AutoCommit),
++) -> (ChangeHash, String) {
++    let actor = ActorId::from(name.as_bytes());
++    let hex = actor.to_hex_string();
++    doc.set_actor(actor);
++    write(doc);
++    (doc.commit().expect("a change"), hex)
++}
++
++fn count_of(doc: &AutoCommit) -> i64 {
++    match doc.get(ROOT, "count").unwrap().unwrap().0 {
++        Value::Scalar(scalar) => match scalar.as_ref() {
++            ScalarValue::Counter(counter) => i64::from(counter),
++            other => panic!("not a counter: {other:?}"),
++        },
++        Value::Object(_) => panic!("not a counter"),
++    }
++}
++
++fn counter_doc() -> AutoCommit {
++    let mut doc = AutoCommit::new();
++    commit_as(&mut doc, "base", |doc| {
++        doc.put(ROOT, "count", ScalarValue::counter(0)).unwrap();
++    });
++    doc
++}
++
++fn increment_by(by: i64) -> impl FnOnce(&mut AutoCommit) {
++    move |doc| doc.increment(ROOT, "count", by).unwrap()
++}
++
++/// Reverts the run as `revert_target` does and returns what it kept and whether it wrote.
++fn revert_run_wrote(doc: &mut AutoCommit, run: (ChangeHash, String)) -> (usize, bool) {
++    doc.set_actor(ActorId::from(b"undo".as_slice()));
++    let outcomes = revert_changes(doc, &[run], &ActorNamed).unwrap();
++    doc.commit();
++    let kept = outcomes.iter().map(|outcome| outcome.kept.len()).sum();
++    (kept, outcomes.iter().any(|outcome| outcome.wrote))
++}
++
++/// Reverts the run as `revert_target` does and returns what it kept.
++fn revert_run(doc: &mut AutoCommit, run: (ChangeHash, String)) -> usize {
++    revert_run_wrote(doc, run).0
++}
++
++#[test]
++fn an_increment_is_taken_back_beside_another_authors_increment() {
++    let mut doc = counter_doc();
++    let run = commit_as(&mut doc, "a", increment_by(5));
++    commit_as(&mut doc, "b", increment_by(-2));
++    assert_eq!(revert_run(&mut doc, run), 0);
++    assert_eq!(count_of(&doc), -2);
++}
++
++#[test]
++fn a_concurrent_increment_by_another_author_is_kept() {
++    let mut doc = counter_doc();
++    let mut peer = doc.fork();
++    let run = commit_as(&mut doc, "a", increment_by(5));
++    commit_as(&mut peer, "b", increment_by(-2));
++    doc.merge_incoming(&mut peer).unwrap();
++    assert_eq!(revert_run(&mut doc, run), 0);
++    assert_eq!(count_of(&doc), -2);
++}
++
++#[test]
++fn a_counter_made_by_the_run_stays_when_another_author_incremented_it() {
++    let mut doc = AutoCommit::new();
++    let run = commit_as(&mut doc, "a", |doc| {
++        doc.put(ROOT, "count", ScalarValue::counter(0)).unwrap();
++        doc.increment(ROOT, "count", 5).unwrap();
++    });
++    commit_as(&mut doc, "b", increment_by(-2));
++    assert_eq!(revert_run(&mut doc, run), 1);
++    assert_eq!(count_of(&doc), 3);
++}
++
++/// A list holding one counter at index 0, starting at zero.
++fn list_counter_doc() -> (AutoCommit, ObjId) {
++    let mut doc = AutoCommit::new().with_actor(ActorId::from(b"base".as_slice()));
++    let list = doc.put_object(ROOT, "list", ObjType::List).unwrap();
++    doc.insert(&list, 0, ScalarValue::counter(0)).unwrap();
++    doc.commit();
++    (doc, list)
++}
++
++fn list_counter_at(doc: &AutoCommit, list: &ObjId, index: usize) -> i64 {
++    match doc.get(list, index).unwrap().unwrap().0 {
++        Value::Scalar(scalar) => match scalar.as_ref() {
++            ScalarValue::Counter(counter) => i64::from(counter),
++            other => panic!("not a counter: {other:?}"),
++        },
++        Value::Object(_) => panic!("not a counter"),
++    }
++}
++
++fn list_str_at(doc: &AutoCommit, list: &ObjId, index: usize) -> Option<String> {
++    let (value, _) = doc.get(list, index).unwrap()?;
++    value.as_str().map(str::to_owned)
++}
++
++#[test]
++fn a_list_counter_is_taken_back_beside_another_authors_increment() {
++    let (mut doc, list) = list_counter_doc();
++    let run = commit_as(&mut doc, "a", |doc| doc.increment(&list, 0, 5).unwrap());
++    commit_as(&mut doc, "b", |doc| doc.increment(&list, 0, -2).unwrap());
++    assert_eq!(revert_run(&mut doc, run), 0);
++    assert_eq!(list_counter_at(&doc, &list, 0), -2);
++}
++
++#[test]
++fn a_list_counter_is_taken_back_after_an_insert_before_it() {
++    let (mut doc, list) = list_counter_doc();
++    let run = commit_as(&mut doc, "a", |doc| doc.increment(&list, 0, 5).unwrap());
++    commit_as(&mut doc, "b", |doc| doc.insert(&list, 0, "theirs").unwrap());
++    assert_eq!(revert_run(&mut doc, run), 0);
++    assert_eq!(list_str_at(&doc, &list, 0).as_deref(), Some("theirs"));
++    assert_eq!(list_counter_at(&doc, &list, 1), 0);
++}
++
++#[test]
++fn a_list_counter_another_author_replaced_is_kept() {
++    let (mut doc, list) = list_counter_doc();
++    let run = commit_as(&mut doc, "a", |doc| doc.increment(&list, 0, 5).unwrap());
++    commit_as(&mut doc, "b", |doc| doc.put(&list, 0, "theirs").unwrap());
++    assert_eq!(revert_run_wrote(&mut doc, run).0, 1);
++    assert_eq!(list_str_at(&doc, &list, 0).as_deref(), Some("theirs"));
++}
++
++#[test]
++fn a_list_counter_another_author_deleted_is_kept_and_nothing_is_written() {
++    let (mut doc, list) = list_counter_doc();
++    let run = commit_as(&mut doc, "a", |doc| doc.increment(&list, 0, 5).unwrap());
++    commit_as(&mut doc, "b", |doc| doc.delete(&list, 0).unwrap());
++    assert_eq!(revert_run_wrote(&mut doc, run), (1, false));
++    assert_eq!(doc.length(&list), 0);
++}
++
++fn put_strs(pairs: &'static [(&'static str, &'static str)]) -> impl FnOnce(&mut AutoCommit) {
++    move |doc| {
++        for (key, value) in pairs {
++            doc.put(ROOT, *key, *value).unwrap();
++        }
++    }
++}
++
++/// The target writes `k0` and `k1`, a later invocation writes `k2`; the target is reverted.
++fn revert_target_siblings(target_actor: &str, later_actor: &str) -> JsonValue {
++    let mut doc = AutoCommit::new();
++    let run = commit_as(
++        &mut doc,
++        target_actor,
++        put_strs(&[("k0", "v0"), ("k1", "v1")]),
++    );
++    commit_as(&mut doc, later_actor, put_strs(&[("k2", "v2")]));
++    assert_eq!(revert_run(&mut doc, run), 0);
++    render(&doc, &ROOT)
++}
++
++#[test]
++fn revert_keeps_later_sibling_edit_by_other_actor() {
++    let after = revert_target_siblings("target", "later");
++
++    assert_eq!(after, serde_json::json!({"k2": "v2"}));
++}
++
++#[test]
++fn revert_keeps_later_sibling_edit_same_actor() {
++    let after = revert_target_siblings("writer", "writer");
++
++    assert_eq!(after, serde_json::json!({"k2": "v2"}));
++}
++
++/// `first` creates the map `m` with the key `a`, `second` then writes `second_key` into it; `first` is reverted.
++fn revert_creator_of_shared_map(second_key: &str) -> JsonValue {
++    let mut doc = AutoCommit::new();
++    let run = commit_as(&mut doc, "first", |doc| {
++        let map = doc.put_object(ROOT, "m", ObjType::Map).unwrap();
++        doc.put(&map, "a", "first").unwrap();
++    });
++    let key = second_key.to_owned();
++    commit_as(&mut doc, "second", move |doc| {
++        let (_, map) = doc.get(ROOT, "m").unwrap().unwrap();
++        doc.put(&map, key, "second").unwrap();
++    });
++    revert_run(&mut doc, run);
++    render(&doc, &ROOT)
++}
++
++#[test]
++fn a_map_the_run_made_stays_whole_when_another_author_wrote_in_it() {
++    let after = revert_creator_of_shared_map("b");
++
++    assert_eq!(
++        after,
++        serde_json::json!({"m": {"a": "first", "b": "second"}})
++    );
++}
++
++#[test]
++fn a_key_another_author_set_again_in_a_shared_map_is_kept() {
++    let after = revert_creator_of_shared_map("a");
++
++    assert_eq!(after, serde_json::json!({"m": {"a": "second"}}));
++}
++
++#[test]
++fn a_key_the_run_wrote_twice_stays_in_a_map_another_author_wrote_in() {
++    let mut doc = AutoCommit::new();
++    let run = commit_as(&mut doc, "first", |doc| {
++        let map = doc.put_object(ROOT, "m", ObjType::Map).unwrap();
++        doc.put(&map, "a", "one").unwrap();
++        doc.put(&map, "a", "two").unwrap();
++    });
++    commit_as(&mut doc, "second", |doc| {
++        let (_, map) = doc.get(ROOT, "m").unwrap().unwrap();
++        doc.put(&map, "b", "second").unwrap();
++    });
++    revert_run(&mut doc, run);
++
++    assert_eq!(
++        render(&doc, &ROOT),
++        serde_json::json!({"m": {"a": "two", "b": "second"}})
++    );
++}
++
++#[test]
++fn an_object_another_author_put_over_the_runs_key_is_kept() {
++    let mut doc = AutoCommit::new();
++    let run = commit_as(&mut doc, "first", |doc| {
++        let map = doc.put_object(ROOT, "m", ObjType::Map).unwrap();
++        doc.put(&map, "a", "one").unwrap();
++    });
++    commit_as(&mut doc, "second", |doc| {
++        let (_, map) = doc.get(ROOT, "m").unwrap().unwrap();
++        let inner = doc.put_object(&map, "a", ObjType::Map).unwrap();
++        doc.put(&inner, "x", "kept").unwrap();
++    });
++    revert_run(&mut doc, run);
++
++    assert_eq!(
++        render(&doc, &ROOT),
++        serde_json::json!({"m": {"a": {"x": "kept"}}})
++    );
++}
++
++fn shared(doc: &AutoCommit, key: &str) -> ObjId {
++    doc.get(ROOT, key).unwrap().unwrap().1
++}
++
++#[test]
++fn an_object_the_run_put_over_its_own_key_keeps_another_authors_edit_inside_it() {
++    let mut doc = AutoCommit::new();
++    let run = commit_as(&mut doc, "first", |doc| {
++        let map = doc.put_object(ROOT, "m", ObjType::Map).unwrap();
++        doc.put(&map, "a", "one").unwrap();
++        doc.put_object(&map, "a", ObjType::Map).unwrap();
++    });
++    commit_as(&mut doc, "second", |doc| {
++        let map = shared(doc, "m");
++        let inner = shared_in(doc, &map, "a");
++        doc.put(&inner, "x", "kept").unwrap();
++    });
++    revert_run(&mut doc, run);
++
++    assert_eq!(
++        render(&doc, &ROOT),
++        serde_json::json!({"m": {"a": {"x": "kept"}}})
++    );
++}
++
++fn shared_in(doc: &AutoCommit, map: &ObjId, key: &str) -> ObjId {
++    doc.get(map, key).unwrap().unwrap().1
++}
++
++#[test]
++fn a_map_in_a_list_stays_whole_when_another_author_wrote_in_it() {
++    let mut doc = AutoCommit::new();
++    commit_as(&mut doc, "base", |doc| {
++        doc.put_object(ROOT, "l", ObjType::List).unwrap();
++    });
++    let run = commit_as(&mut doc, "first", |doc| {
++        let list = shared(doc, "l");
++        let map = doc.insert_object(&list, 0, ObjType::Map).unwrap();
++        doc.put(&map, "a", "one").unwrap();
++    });
++    commit_as(&mut doc, "second", |doc| {
++        let list = shared(doc, "l");
++        let map = shared_at(doc, &list, 0);
++        doc.put(&map, "b", "second").unwrap();
++    });
++    revert_run(&mut doc, run);
++
++    assert_eq!(
++        render(&doc, &ROOT),
++        serde_json::json!({"l": [{"a": "one", "b": "second"}]})
++    );
++}
++
++fn shared_at(doc: &AutoCommit, list: &ObjId, index: usize) -> ObjId {
++    doc.get(list, index).unwrap().unwrap().1
++}
++
++fn base_with_map() -> AutoCommit {
++    let mut doc = AutoCommit::new();
++    commit_as(&mut doc, "base", |doc| {
++        doc.put_object(ROOT, "m", ObjType::Map).unwrap();
++    });
++    doc
++}
++
++/// Two authors write the shared map at the same time and merge in either order; `first` is reverted.
++fn concurrent_in_shared_map(
++    first_key: &str,
++    second_key: &str,
++    first_merges_second: bool,
++) -> AutoCommit {
++    let mut left = base_with_map();
++    let mut right = left.fork();
++    let (first_key, second_key) = (first_key.to_owned(), second_key.to_owned());
++    let run = commit_as(&mut left, "first", move |doc| {
++        let map = shared(doc, "m");
++        doc.put(&map, first_key, "first").unwrap();
++    });
++    commit_as(&mut right, "second", move |doc| {
++        let map = shared(doc, "m");
++        doc.put(&map, second_key, "second").unwrap();
++    });
++    if first_merges_second {
++        left.merge_incoming(&mut right).unwrap();
++        revert_run(&mut left, run);
++        left
++    } else {
++        right.merge_incoming(&mut left).unwrap();
++        revert_run(&mut right, run);
++        right
++    }
++}
++
++#[test]
++fn concurrent_sibling_keys_in_a_shared_map_lose_only_the_reverted_one_in_either_merge_order() {
++    for first_merges_second in [true, false] {
++        let doc = concurrent_in_shared_map("a", "b", first_merges_second);
++
++        assert_eq!(
++            render(&doc, &ROOT),
++            serde_json::json!({"m": {"b": "second"}})
++        );
++    }
++}
++
++#[test]
++fn a_concurrent_write_to_the_same_key_is_never_deleted_in_either_merge_order() {
++    for first_merges_second in [true, false] {
++        let doc = concurrent_in_shared_map("a", "a", first_merges_second);
++        let map = shared(&doc, "m");
++
++        assert!(doc.get(&map, "a").unwrap().is_some());
++    }
++}
++
++#[test]
++fn a_map_the_run_put_over_an_older_one_keeps_its_replacement_free_of_the_older_keys() {
++    let mut doc = AutoCommit::new();
++    commit_as(&mut doc, "base", |doc| {
++        let old = doc.put_object(ROOT, "m", ObjType::Map).unwrap();
++        doc.put(&old, "k", "old").unwrap();
++    });
++    let run = commit_as(&mut doc, "first", |doc| {
++        let map = doc.put_object(ROOT, "m", ObjType::Map).unwrap();
++        doc.put(&map, "a", "one").unwrap();
++    });
++    commit_as(&mut doc, "second", |doc| {
++        let map = shared(doc, "m");
++        doc.put(&map, "b", "second").unwrap();
++    });
++    revert_run(&mut doc, run);
++
++    assert_eq!(
++        render(&doc, &ROOT),
++        serde_json::json!({"m": {"a": "one", "b": "second"}})
++    );
++}
++
++/// `first` creates `m` with a nested map `n`, `second` writes `second_key` into `m`, `third` optionally writes inside `n`.
++fn revert_creator_of_nested_shared_map(third_writes_inside_n: bool) -> JsonValue {
++    let mut doc = AutoCommit::new();
++    let run = commit_as(&mut doc, "first", |doc| {
++        let map = doc.put_object(ROOT, "m", ObjType::Map).unwrap();
++        let nested = doc.put_object(&map, "n", ObjType::Map).unwrap();
++        doc.put(&nested, "x", "one").unwrap();
++    });
++    commit_as(&mut doc, "second", |doc| {
++        let map = shared(doc, "m");
++        doc.put(&map, "b", "second").unwrap();
++    });
++    if third_writes_inside_n {
++        commit_as(&mut doc, "third", |doc| {
++            let map = shared(doc, "m");
++            let nested = shared_in(doc, &map, "n");
++            doc.put(&nested, "y", "third").unwrap();
++        });
++    }
++    revert_run(&mut doc, run);
++    render(&doc, &ROOT)
++}
++
++#[test]
++fn a_nested_map_the_run_made_stays_with_its_parent_when_another_author_wrote_in_the_parent() {
++    let after = revert_creator_of_nested_shared_map(false);
++
++    assert_eq!(
++        after,
++        serde_json::json!({"m": {"b": "second", "n": {"x": "one"}}})
++    );
++}
++
++#[test]
++fn a_nested_map_the_run_made_stays_when_another_author_wrote_inside_it() {
++    let after = revert_creator_of_nested_shared_map(true);
++
++    assert_eq!(
++        after,
++        serde_json::json!({"m": {"b": "second", "n": {"x": "one", "y": "third"}}})
++    );
++}
++
++#[test]
++fn an_object_the_run_replaced_in_its_own_change_keeps_another_authors_edit_inside_the_new_one() {
++    let mut doc = AutoCommit::new();
++    let run = commit_as(&mut doc, "first", |doc| {
++        let map = doc.put_object(ROOT, "m", ObjType::Map).unwrap();
++        doc.put_object(&map, "n", ObjType::Map).unwrap();
++        let second = doc.put_object(&map, "n", ObjType::Map).unwrap();
++        doc.put(&second, "x", "one").unwrap();
++    });
++    commit_as(&mut doc, "second", |doc| {
++        let map = shared(doc, "m");
++        doc.put(&map, "b", "second").unwrap();
++        let nested = shared_in(doc, &map, "n");
++        doc.put(&nested, "y", "third").unwrap();
++    });
++    revert_run(&mut doc, run);
++
++    assert_eq!(
++        render(&doc, &ROOT),
++        serde_json::json!({"m": {"b": "second", "n": {"x": "one", "y": "third"}}})
++    );
++}
++
++/// A block (a map holding a type and a text) in a list, made by `first`; `second` changes it as `edit` says.
++fn revert_creator_of_block(edit: fn(&mut AutoCommit, &ObjId)) -> JsonValue {
++    let mut doc = AutoCommit::new();
++    commit_as(&mut doc, "base", |doc| {
++        doc.put_object(ROOT, "blocks", ObjType::List).unwrap();
++    });
++    let run = commit_as(&mut doc, "first", |doc| {
++        let list = shared(doc, "blocks");
++        let block = doc.insert_object(&list, 0, ObjType::Map).unwrap();
++        doc.put(&block, "type", "paragraph").unwrap();
++        let text = doc.put_object(&block, "text", ObjType::Text).unwrap();
++        doc.splice_text(&text, 0, 0, "Figure 1").unwrap();
++    });
++    commit_as(&mut doc, "second", |doc| {
++        let list = shared(doc, "blocks");
++        edit(doc, &shared_at(doc, &list, 0));
++    });
++    revert_run(&mut doc, run);
++    render(&doc, &ROOT)
++}
++
++#[test]
++fn a_block_another_author_edited_the_text_of_stays_whole() {
++    let after = revert_creator_of_block(|doc, block| {
++        let text = shared_in(doc, block, "text");
++        doc.splice_text(&text, 0, 0, "Revised. ").unwrap();
++    });
++
++    assert_eq!(
++        after,
++        serde_json::json!({"blocks": [{"type": "paragraph", "text": "Revised. Figure 1"}]})
++    );
++}
++
++#[test]
++fn a_block_another_author_added_an_attribute_to_stays_whole() {
++    let after = revert_creator_of_block(|doc, block| {
++        doc.put(block, "align", "center").unwrap();
++    });
++
++    assert_eq!(
++        after,
++        serde_json::json!({"blocks": [{"type": "paragraph", "text": "Figure 1", "align": "center"}]})
++    );
++}
++
++const GATE_SEEDS: u64 = 1000;
++
++fn gate(authors: Authors) {
++    let counts = count_range(authors, 0..GATE_SEEDS);
++    assert!(
++        counts.independent > 0,
++        "no independent histories were generated"
++    );
++    assert_eq!(counts.replay_errors, 0, "histories failed to replay");
++    assert_eq!(
++        counts.violations,
++        0,
++        "first counterexample: {}",
++        serde_json::json!(
++            counts
++                .counterexamples
++                .first()
++                .map(undo_gen::counterexample_json)
++        )
++    );
++}
++
++#[test]
++fn gate_selective_revert_distinct_actors() {
++    gate(Authors::Distinct);
++}
++
++#[test]
++fn gate_selective_revert_single_actor() {
++    gate(Authors::Single);
++}
++
++#[test]
++#[ignore = "a measurement: run it by name"]
++fn measure_selective_revert() {
++    let seeds = env::var("TILO_SEEDS")
++        .ok()
++        .and_then(|value| value.parse::<u64>().ok())
++        .unwrap_or(2000);
++
++    let output = serde_json::json!({
++        "distinct_actors": measure(Authors::Distinct, seeds),
++        "single_actor": measure(Authors::Single, seeds),
++    });
++
++    println!("{output}");
++}

@@ -1,0 +1,197 @@
+--- a/crates/core/resource-store/src/history/revert.rs
++++ b/crates/core/resource-store/src/history/revert.rs
+@@ -74,6 +74,10 @@
+     /// written inside. Undoing the run would remove the container and take
+     /// their work with it, so the container stays.
+     Object(ObjId),
++    /// One element of a list, named by its cursor so the identity survives
++    /// index shifts. Another writer replacing or deleting it overwrites the run's
++    /// change to it; their increments do not.
++    Element(ObjId, String),
+ }
+ 
+ /// A slot the revert declined to touch, and why.
+@@ -208,6 +212,50 @@
+     }
+ }
+ 
++/// The list element at `index` as of `heads`, named by its cursor.
++fn element_slot(doc: &AutoCommit, obj: &ObjId, index: usize, heads: &[ChangeHash]) -> Option<Slot> {
++    if !matches!(doc.object_type(obj), Ok(ObjType::List)) {
++        return None;
++    }
++    let cursor = doc.get_cursor(obj, index, Some(heads)).ok()?;
++    Some(Slot::Element(obj.clone(), cursor.to_string()))
++}
++
++/// The list elements a later change `p` (read between `lo` and `hi`) replaced,
++/// deleted or incremented.
++fn element_slots(
++    doc: &AutoCommit,
++    p: &Patch,
++    (lo, hi): (&[ChangeHash], &[ChangeHash]),
++) -> Vec<Slot> {
++    // A replaced or deleted element is named before the change: after a
++    // replacement the cursor at that index names the new value, not the element.
++    let (indices, heads) = match &p.action {
++        PatchAction::Increment {
++            prop: Prop::Seq(index),
++            ..
++        } => (*index..index.saturating_add(1), hi),
++        PatchAction::PutSeq { index, .. } => (*index..index.saturating_add(1), lo),
++        PatchAction::DeleteSeq { index, length } => (*index..index.saturating_add(*length), lo),
++        _ => return Vec::new(),
++    };
++    indices
++        .filter_map(|index| element_slot(doc, &p.obj, index, heads))
++        .collect()
++}
++
++/// The list element a counter increment in the inverse patch `p` lands on.
++fn element_increment(doc: &AutoCommit, p: &Patch, heads: &[ChangeHash]) -> Option<Slot> {
++    let PatchAction::Increment {
++        prop: Prop::Seq(index),
++        ..
++    } = &p.action
++    else {
++        return None;
++    };
++    element_slot(doc, &p.obj, *index, heads)
++}
++
+ /// Whether `p` writes a text object's characters: what [`text::rewritten`]
+ /// decides for the whole text.
+ fn writes_text(doc: &AutoCommit, p: &Patch) -> bool {
+@@ -227,12 +275,15 @@
+ /// two members a prefix can have several concurrent frontiers.
+ fn first_index_after(doc: &mut AutoCommit, after: &[ChangeHash], total: usize) -> usize {
+     let after_set: HashSet<ChangeHash> = after.iter().copied().collect();
+-    for i in 0..total {
+-        let hs: HashSet<ChangeHash> = tilo_resource::history::prefix_heads(doc, i)
+-            .into_iter()
+-            .collect();
+-        if hs == after_set {
+-            // `i < total` inside this loop, so this never saturates.
++    // The heads of each prefix, kept as the prefix grows: a change leaves them when a later
++    // change depends on it. Rebuilding them per prefix made this quadratic in the history.
++    let mut heads: HashSet<ChangeHash> = HashSet::new();
++    for (i, meta) in doc.get_changes_meta(&[]).iter().take(total).enumerate() {
++        for dep in &meta.deps {
++            heads.remove(dep);
++        }
++        heads.insert(meta.hash);
++        if heads == after_set {
+             return i.saturating_add(1);
+         }
+     }
+@@ -287,10 +338,15 @@
+     (objects_created(&patches), wrote)
+ }
+ 
++/// Slots a later change wrote, each with the first actor that wrote it.
++type Writers = HashMap<Slot, String>;
++
+ /// What changes after a run wrote, by whom: [`later_writers`].
+ struct Later {
+     /// Each slot, with the first actor that wrote it.
+     slots: HashMap<Slot, String>,
++    /// Like `slots`, without increments: those commute, so they overwrite nothing.
++    overwrites: HashMap<Slot, String>,
+     /// What changes made with the run in their history typed and deleted
+     /// in each text object.
+     text: HashMap<ObjId, text::LaterText>,
+@@ -376,6 +432,7 @@
+         HashSet::new()
+     };
+     let mut out: HashMap<Slot, String> = HashMap::new();
++    let mut overwrites: HashMap<Slot, String> = HashMap::new();
+     let mut typed: HashMap<ObjId, text::LaterText> = HashMap::new();
+     for i in start_at..versions.len() {
+         // `i` is always `< versions.len()` by the loop bound; retain the
+@@ -418,7 +475,15 @@
+             text::record_later(doc, &patches, (&lo, &hi), &v.actor, &mut typed);
+         }
+         for p in &patches {
+-            if let Some(s) = slot_of(p) {
++            let slots = slot_of(p)
++                .into_iter()
++                .chain(element_slots(doc, p, (&lo, &hi)));
++            for s in slots {
++                if !matches!(p.action, PatchAction::Increment { .. }) {
++                    overwrites
++                        .entry(s.clone())
++                        .or_insert_with(|| v.actor.clone());
++                }
+                 out.entry(s).or_insert_with(|| v.actor.clone());
+             }
+             // Every created ancestor is protected: the inverse deletes the
+@@ -434,6 +499,7 @@
+     }
+     Later {
+         slots: out,
++        overwrites,
+         text: typed,
+     }
+ }
+@@ -483,7 +549,7 @@
+ fn classify(
+     doc: &AutoCommit,
+     inverse: Vec<Patch>,
+-    (later, rewritten): (&HashMap<Slot, String>, &HashMap<ObjId, String>),
++    (later, overwrites, rewritten): (&Writers, &Writers, &HashMap<ObjId, String>),
+     after: &[ChangeHash],
+     covered: usize,
+     authors: &dyn ResolveAuthor,
+@@ -494,8 +560,18 @@
+     let mut kept_seen: HashSet<Slot> = HashSet::new();
+     let mut reverted_slots: HashSet<Slot> = HashSet::new();
+     let mut structural = 0usize;
++    // Map keys whose container stays: what the inverse would write beneath them belongs to the
++    // container the run replaced, and would land in the one that stays.
++    let mut held_back: HashSet<(ObjId, String)> = HashSet::new();
+ 
+     for p in inverse {
++        if p.path.iter().any(|(obj, prop)| match prop {
++            Prop::Map(key) => held_back.contains(&(obj.clone(), key.clone())),
++            Prop::Seq(_) => false,
++        }) {
++            writable.push((p, false));
++            continue;
++        }
+         // Removals first: they are the patches that can destroy a container.
+         match &p.action {
+             PatchAction::Insert { index, values }
+@@ -555,6 +631,7 @@
+                 if let Some((slot, actor)) =
+                     blocked_container(doc, after, &p.obj, key.as_str(), later)
+                 {
++                    held_back.insert((p.obj.clone(), key.clone()));
+                     if kept_seen.insert(slot.clone()) {
+                         kept.push(KeptSlot {
+                             by: authors.resolve(&actor),
+@@ -586,8 +663,14 @@
+             }
+             continue;
+         }
+-        if let Some(s) = slot_of(&p) {
+-            if let Some(actor) = later.get(&s) {
++        if let Some(s) = slot_of(&p).or_else(|| element_increment(doc, &p, after)) {
++            // Increments commute: another author's increment overwrites nothing of the run's.
++            let writers = if matches!(p.action, PatchAction::Increment { .. }) {
++                overwrites
++            } else {
++                later
++            };
++            if let Some(actor) = writers.get(&s) {
+                 if kept_seen.insert(s.clone()) {
+                     kept.push(KeptSlot {
+                         by: authors.resolve(actor),
+@@ -656,7 +739,7 @@
+     classify(
+         doc,
+         inverse,
+-        (&later.slots, &rewritten),
++        (&later.slots, &later.overwrites, &rewritten),
+         after,
+         covered,
+         authors,

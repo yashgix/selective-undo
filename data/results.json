@@ -1,0 +1,224 @@
+{
+ "original": {
+  "commit": "b0c1734a00",
+  "upstream_base": "2fcb9946fe",
+  "benchmark": {
+   "histories": 2000,
+   "independent": 1300,
+   "today_break": 678,
+   "with_change_break": 1,
+   "replay_errors": 0,
+   "note": "the one remaining case is a list-order choice"
+  },
+  "latency_median_us": [
+   {
+    "items": 100,
+    "shape": "one_change",
+    "today_us": 4790,
+    "first_hook_us": 2081,
+    "final_hook_us": 1318
+   },
+   {
+    "items": 100,
+    "shape": "many_changes",
+    "today_us": 5528,
+    "first_hook_us": 9798,
+    "final_hook_us": 2697
+   },
+   {
+    "items": 1000,
+    "shape": "one_change",
+    "today_us": 43934,
+    "first_hook_us": 5395,
+    "final_hook_us": 4443
+   },
+   {
+    "items": 1000,
+    "shape": "many_changes",
+    "today_us": 47527,
+    "first_hook_us": 357632,
+    "final_hook_us": 18175
+   },
+   {
+    "items": 10000,
+    "shape": "one_change",
+    "today_us": 430264,
+    "first_hook_us": 37614,
+    "final_hook_us": 36632
+   },
+   {
+    "items": 10000,
+    "shape": "many_changes",
+    "today_us": 599339,
+    "first_hook_us": 33118476,
+    "final_hook_us": 188895
+   }
+  ],
+  "latency_conditions": "release build without LTO, 2 CPUs, 31 rounds per cell, one undo. macOS storage services used 128 to 152% of a core during the final run, load average about 6. The first-hook column was measured earlier, while a stray process also held a core. Three later runs agree within about 15%.",
+  "reactions": {
+   "setup": "two stores that sync, using the workspace service's undo, driven by the commands a Chat reaction sends",
+   "cases": [
+    {
+     "case": "Ada reacts, Ben reacts, Ada undoes",
+     "today": [
+      "(none)"
+     ],
+     "with_change": [
+      "ben"
+     ]
+    },
+    {
+     "case": "Cy reacted earlier, then Ada, then Ben, Ada undoes",
+     "today": [
+      "cy"
+     ],
+     "with_change": [
+      "ben",
+      "cy"
+     ]
+    }
+   ]
+  },
+  "tests": {
+   "default": 86,
+   "ignored_measurements": 7,
+   "files": {
+    "content_undo": 11,
+    "selective_undo": 5,
+    "selective_revert": 31,
+    "selective_undo_store": 19,
+    "selective_undo_text_counter": 8,
+    "selective_undo_merge": 5,
+    "selective_undo_reactions": 7
+   }
+  }
+ },
+ "upstream_main": {
+  "commit": "b06ae3fe8e",
+  "landed": "2026-11-24T12:47Z",
+  "commits": [
+   "dd0f8bbc37",
+   "a6758222e2"
+  ],
+  "benchmark": {
+   "histories": 2000,
+   "independent": 1300,
+   "p1_violations": 0,
+   "replay_errors": 0
+  },
+  "reactions": {
+   "ada_first_then_ben": [
+    "ada",
+    "ben"
+   ],
+   "cy_earlier": [
+    "ben",
+    "cy"
+   ]
+  }
+ },
+ "current": {
+  "issue": "https://code.tilo.so/tilo/tilo/issues/5993",
+  "issue_number": 5993,
+  "main_commit": "b06ae3fe8e",
+  "old_base": "2fcb9946fe",
+  "latency_median_us": [
+   {
+    "items": 100,
+    "shape": "one_change",
+    "old_store_us": 4790,
+    "main_us": 914,
+    "fixed_us": 309
+   },
+   {
+    "items": 100,
+    "shape": "many_changes",
+    "old_store_us": 5528,
+    "main_us": 6449,
+    "fixed_us": 637
+   },
+   {
+    "items": 1000,
+    "shape": "one_change",
+    "old_store_us": 43934,
+    "main_us": 1124,
+    "fixed_us": 508
+   },
+   {
+    "items": 1000,
+    "shape": "many_changes",
+    "old_store_us": 47527,
+    "main_us": 272337,
+    "fixed_us": 3504
+   },
+   {
+    "items": 10000,
+    "shape": "one_change",
+    "old_store_us": 430264,
+    "main_us": 3313,
+    "fixed_us": 2874
+   },
+   {
+    "items": 10000,
+    "shape": "many_changes",
+    "old_store_us": 599339,
+    "main_us": 26030182,
+    "fixed_us": 32646
+   }
+  ],
+  "conditions": "release build, 31 rounds per cell, one undo, run alone. During the runs on main the macOS storage services used 85 to 163% of a core and the load average was 5 to 7. The old-store column was measured earlier on the same machine under similar load (load 6 to 14).",
+  "benchmark_after_fix": {
+   "histories": 2000,
+   "independent": 1300,
+   "p1_violations": 0,
+   "replay_errors": 0
+  },
+  "clippy": "store library passes with -D warnings; unmodified upstream fails in crates/sdk/tilo-doc/src/table_source.rs (3 arithmetic_side_effects errors); that lint allowed in a scratch copy only"
+ },
+ "correctness": {
+  "main_commit_tested": "b06ae3fe8e",
+  "main_commit_checked_later": "ba62261d8f",
+  "ported_tests": {
+   "total": 27,
+   "fail_on_main": 6,
+   "fail_with_repair": 0,
+   "failing": [
+    "undoing_a_counter_step_beside_a_peers_step_keeps_theirs",
+    "a_concurrent_increment_by_another_author_is_kept",
+    "an_increment_is_taken_back_beside_another_authors_increment",
+    "a_map_the_run_put_over_an_older_one_keeps_its_replacement_free_of_the_older_keys",
+    "a_list_counter_another_author_replaced_is_kept",
+    "a_list_counter_another_author_deleted_is_kept_and_nothing_is_written"
+   ],
+   "revert_focus": 23,
+   "merge_focus": 4
+  },
+  "counter": {
+   "start": 0,
+   "ada": 5,
+   "ben": -2,
+   "after_undo_main": 3,
+   "after_undo_repair": -2
+  },
+  "replaced_map": {
+   "main": "{a, b, k: old}",
+   "repair": "{a, b}"
+  },
+  "list_counter_kept_reported": {
+   "main": 0,
+   "repair": 1
+  },
+  "lines": {
+   "added": 85,
+   "removed": 5
+  },
+  "status": "drafted locally, not filed",
+  "generator_gate": {
+   "histories": 2000,
+   "independent": 1300,
+   "p1_violations_correctness_only": 0,
+   "p1_violations_combined": 0,
+   "replay_errors": 0
+  }
+ }
+}

@@ -1,0 +1,24 @@
+--- a/crates/core/resource-store/src/history/revert.rs
++++ b/crates/core/resource-store/src/history/revert.rs
+@@ -227,12 +227,15 @@
+ /// two members a prefix can have several concurrent frontiers.
+ fn first_index_after(doc: &mut AutoCommit, after: &[ChangeHash], total: usize) -> usize {
+     let after_set: HashSet<ChangeHash> = after.iter().copied().collect();
+-    for i in 0..total {
+-        let hs: HashSet<ChangeHash> = tilo_resource::history::prefix_heads(doc, i)
+-            .into_iter()
+-            .collect();
+-        if hs == after_set {
+-            // `i < total` inside this loop, so this never saturates.
++    // The heads of each prefix, kept as the prefix grows: a change leaves them when a later
++    // change depends on it. Rebuilding them per prefix made this quadratic in the history.
++    let mut heads: HashSet<ChangeHash> = HashSet::new();
++    for (i, meta) in doc.get_changes_meta(&[]).iter().take(total).enumerate() {
++        for dep in &meta.deps {
++            heads.remove(dep);
++        }
++        heads.insert(meta.hash);
++        if heads == after_set {
+             return i.saturating_add(1);
+         }
+     }
