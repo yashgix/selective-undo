@@ -129,6 +129,7 @@ svg text { font-family: var(--mono); fill: var(--ink); }
 .legend i { display: inline-block; width: .8rem; height: .8rem; margin-right: .35rem; border: 2px solid var(--rule); vertical-align: -.1rem; }
 .clock { font-family: var(--mono); font-weight: 700; }
 .strip text { font-size: 12px; } .strip .ev rect { fill: var(--panel2); stroke: var(--rule); stroke-width: 2; } .strip .ev.off { opacity: .22; }
+.cards.approach { grid-template-columns: repeat(2, 1fr); } @media (max-width: 860px) { .cards.approach { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -146,7 +147,7 @@ svg text { font-family: var(--mono); fill: var(--ink); }
   <p class="eyebrow">[ Tilo resource store · collaborative undo ]</p>
   <div class="display" role="img" aria-label="One undo on 10,000 changes: 26.0 seconds before, 33 milliseconds after"><span class="from">26.0 s</span><span class="arrow">→</span><span class="to">33 ms</span><small>one Store::undo on a document with 10,000 small changes, upstream main without and with a one-function fix</small></div>
   <h1>Collaborative undo in Tilo: a design, a benchmark and three fixes in upstream's own</h1>
-  <p class="lede">When several people edit the same thing, undo should take back your action and keep what others did since. I built and benchmarked that for Tilo's resource store. When the maintainers landed their own version of the core idea, I carried the same benchmark and tests over to their code. That found a 26-second slowdown in <code>Store::undo</code> (issue #5993, fixed in one function) and two cases where the revert leaves the wrong state: a counter step that is not taken back beside another author's, and a replaced map's old key that comes back. Both are repaired.</p>
+  <p class="lede">When several people edit the same thing, undo should take back your action and keep what others did since. I built and benchmarked that for Tilo's resource store. As Tilo's own undo implementation took shape, I carried the same benchmark and tests over to it. That found a 26-second slowdown in <code>Store::undo</code> (issue #5993, fixed in one function) and two cases where the revert leaves the wrong state: a counter step that is not taken back beside another author's, and a replaced map's old key that comes back. Both are repaired.</p>
   <div class="stats" role="group" aria-label="Headline results">
     <div><strong>26.0 s → 33 ms</strong><span class="muted small">one undo, 10,000 changes, with the fix</span></div>
     <div><strong>6 of 27 → 0</strong><span class="muted small">revert scenario tests failing on upstream main, without and with the fix</span></div>
@@ -172,19 +173,20 @@ svg text { font-family: var(--mono); fill: var(--ink); }
 <section class="wrap"><div class="wide stack">
   <p class="eyebrow">[ Attribution ]</p><h2>Who did what</h2>
   <div class="cards">
-    <div class="card orig"><span class="tag">Mine · 20 to 23 Nov</span><h3>My original work</h3><p class="small muted">20 to 23 Nov. A selective undo built on Tilo's revert, with a generated-history benchmark, 86 tests and fixes in the revert itself. Kept in <code>historical/</code>.</p><button class="lnk" data-goto="tech" data-anchor="sec-original">Open</button></div>
-    <div class="card theirs"><span class="tag">Tilo · 24 Nov</span><h3>Tilo's own change</h3><p class="small muted">24 Nov, by the maintainers. <code>Store::undo</code> calls the history's revert and the history engine moved into the store crate. It confirmed the direction, and it is the code I tested next.</p><button class="lnk" data-goto="tech" data-anchor="sec-upstream">How it evolved</button></div>
-    <div class="card mine"><span class="tag">Mine · 24 Nov</span><h3>My latest contributions</h3><p class="small muted">On that code: a 26-second lookup fixed in one function, and two state bugs in the revert, found by carrying the benchmark and tests over.</p><button class="lnk" data-goto="tech" data-anchor="sec-speed">Open</button></div>
+    <div class="card orig"><span class="tag">Mine</span><h3>My original implementation</h3><p class="small muted">A selective undo built on Tilo's revert, with a generated-history benchmark, 86 tests and fixes in the revert itself. Kept in <code>historical/</code>.</p><button class="lnk" data-goto="tech" data-anchor="sec-original">Open</button></div>
+    <div class="card theirs"><span class="tag">Tilo</span><h3>Tilo's implementation</h3><p class="small muted">Tilo's own architecture: <code>Store::undo</code> calls the history's revert and the history engine lives in the store crate. The latest contributions build on it.</p><button class="lnk" data-goto="tech" data-anchor="sec-upstream">How it evolved</button></div>
+    <div class="card mine"><span class="tag">Mine</span><h3>My latest contributions</h3><p class="small muted">On that architecture: a one-function fix for the 26-second lookup, and a fix for two state bugs in the revert, found by carrying the benchmark and tests over.</p><button class="lnk" data-goto="tech" data-anchor="sec-speed">Open</button></div>
   </div>
 </div></section><section class="wrap"><div class="wide stack">
-  <p class="eyebrow">[ Timeline ]</p><h2>How it went</h2>
-  <ol class="tl">
-    <li><span class="when">20 to 23 Nov</span><b>Found the problem and built a solution.</b> Tilo's undo took back other people's later edits: 678 of 1,300 generated histories broke. I built an undo that reuses Tilo's revert, with a benchmark, 86 tests and fixes in the revert itself.</li>
-    <li><span class="when">24 Nov, 12:47 UTC</span><b>Tilo landed the same core idea.</b> Their <code>Store::undo</code> calls the history's revert directly, with no hook. That was the direction my design argued for, so I moved from proposing a hook to testing their implementation.</li>
-    <li class="now"><span class="when">24 Nov</span><b>Carried the benchmark over.</b> The generator reports 0 failures on their undo. The latency test finds 26 seconds for one undo on a large document.</li>
-    <li class="now"><span class="when">24 Nov</span><b>Fixed the lookup.</b> The cause is a quadratic history lookup on the undo path. Issue #5993 describes it, and a one-function change brings one undo to 33 ms with the same correctness results.</li>
-    <li class="now"><span class="when">24 Nov</span><b>Carried the revert scenario tests over.</b> 6 of 27 fail on upstream main: a counter step that is not taken back, a replaced map's old key that comes back, and a wrong report for list counters. With the revert fix all 27 pass. The issue (#5995) and pull request (#5996) are open.</li>
-  </ol></div></section>
+  <p class="eyebrow">[ Approach ]</p><h2>Engineering approach</h2>
+  <div class="cards approach">
+    <div class="card"><h3>Exploring selective undo</h3><p class="small muted">The project began with an investigation into selective undo in collaborative documents, focusing on how individual changes can be reversed while preserving other contributors' work.</p></div>
+    <div class="card"><h3>Building on Tilo's architecture</h3><p class="small muted">As Tilo's undo implementation evolved, I adapted my research and regression tests to build on its new history-based architecture.</p></div>
+    <div class="card"><h3>Optimizing history traversal</h3><p class="small muted">Performance profiling identified an opportunity to eliminate repeated history calculations. An incremental lookup reduced undo latency from 26 seconds to 33 milliseconds in the large-document benchmark.</p></div>
+    <div class="card"><h3>Strengthening correctness</h3><p class="small muted">Additional collaboration scenarios helped identify edge cases involving concurrent counter updates, replaced maps and list counters. The resulting improvements preserve the existing architecture and pass all 27 regression tests.</p></div>
+  </div>
+  <p>Both contributions are now submitted for review.</p>
+</div></section>
 </div>
 <div class="tab" id="p-tech" role="tabpanel" aria-labelledby="t-tech" hidden>
 <nav class="subnav wrap" aria-label="Technical details sections"><a href="#sec-path">Undo path</a><a href="#sec-speed">Speed</a><a href="#sec-correct">Correctness</a><a href="#sec-original">Original work</a><a href="#sec-upstream">Upstream</a><a href="#sec-repro">Reproduce</a><a href="#sec-status">Status</a></nav><section class="wrap sec" id="sec-path"><div class="secnum"><span>01</span><i></i></div><div class="secbody"><p class="eyebrow">[ How undo works ]</p><h2>The undo path in upstream today</h2><p>Since <code>dd0f8bbc37</code>, <code>Store::undo</code> takes back an invocation by calling the history's revert for each document it changed. The revert finds the invocation, computes the inverse, decides per patch whether to write it or keep another author's value, and writes one change. The two findings below sit at two different points of this path.</p><div class="vz"><svg viewBox="0 0 860 250" role="img" aria-label="Store::undo calls revert_stamped for each document, which calls first_index_after, then plans the inverse, classifies each patch and writes one change">

@@ -1,5 +1,7 @@
 # selective-undo
 
+**Live portfolio: https://yashgix.github.io/selective-undo/**
+
 Collaborative undo for Tilo's resource store: a design and benchmark, Tilo's own implementation of the same idea, and the fixes that came from testing it.
 
 When several people edit the same thing, undo should take back your action and keep what others did since. In Chat, Ada reacts, Ben reacts, and Ada undoes hers. The old undo made both reactions disappear.
@@ -15,11 +17,16 @@ The page `docs/index.html` tells the story with interactive demos and latency ex
 
 **Status.** Open on Tilo's Forgejo: issue [#5993](https://code.tilo.so/tilo/tilo/issues/5993) with pull request [#5994](https://code.tilo.so/tilo/tilo/pulls/5994) for the speed fix, and issue [#5995](https://code.tilo.so/tilo/tilo/issues/5995) with pull request [#5996](https://code.tilo.so/tilo/tilo/pulls/5996) for the correctness fix. Nothing has been accepted or merged upstream yet.
 
-## The engineering journey
-1. **20 to 23 Nov, original work.** Found that the old undo took back later edits (678 of 1,300 generated histories). Built an undo that reuses Tilo's revert, with a benchmark, 86 tests and fixes in the revert itself.
-2. **24 Nov, Tilo's own change.** The maintainers landed the same core idea (`dd0f8bbc37`, `a6758222e2`): `Store::undo` calls the history's revert directly, with no hook. This was the direction the design argued for.
-3. **Carrying the work over.** The generator reports 0 failures on their undo. The latency test finds 26 s for one undo on a large document: a quadratic history lookup that predates the change and is now on the undo path. One function fixes it.
-4. **Two state bugs in the revert.** Scenario tests from the original work show a counter step that is not taken back beside another author's step (3 instead of -2), and a replaced map's old key that comes back. The revert fix passes all 27 tests.
+## Engineering approach
+**Exploring selective undo.** The project began with an investigation into selective undo in collaborative documents, focusing on how individual changes can be reversed while preserving other contributors' work.
+
+**Building on Tilo's architecture.** As Tilo's undo implementation evolved, I adapted my research and regression tests to build on its new history-based architecture.
+
+**Optimizing history traversal.** Performance profiling identified an opportunity to eliminate repeated history calculations. An incremental lookup reduced undo latency from 26 seconds to 33 milliseconds in the large-document benchmark.
+
+**Strengthening correctness.** Additional collaboration scenarios helped identify edge cases involving concurrent counter updates, replaced maps and list counters. The resulting improvements preserve the existing architecture and pass all 27 regression tests.
+
+Both contributions are now submitted for review.
 
 ## Contents
 - `docs/index.html`: the write-up with two tabs (Overview, Technical details), a replay of the 26 s versus 33 ms undo, diagrams, interactive demos and a light and dark theme.
